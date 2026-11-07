@@ -67,3 +67,7 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+# The NAS toolchain is deployed to Linux and tests/audit.py checks for LF;
+# keep it LF in every checkout regardless of core.autocrlf.
+nas/** text eol=lf
