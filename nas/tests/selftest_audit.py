@@ -82,6 +82,36 @@
   M75 RTT 取最后一次 (min-of-N 退化成"留最后一次": 一次 1020ms 抖动就把 89MiB/s 的节点判成远)  -> C68
   M76 L0 无总预算 (预算判定恒不成立: 261 个节点 × 3 次握手, 池子越长越无边)  -> C69
   M77 握手失败当 0ms (ms 非 None 那道门压成 0.0: 死节点升序排第一, 挤掉真节点)  -> C68
+  M78 注解竖线 None (pool_refresh.py 写 def f(x: int 竖线 None): 3.8 定义期即 TypeError)  -> A22
+  M79 注释被判成代码 (只在 pool_refresh.py 顶部加一行注释写 int 竖线 None: A22 必须仍绿)  -> GREEN
+  M80 README 数字漂移 (RTT_TOP 48->72 而 README 仍用 48 论证: 137 项曾全绿)  -> A23
+  M81 样本丢快测表 (build_sample 的 quick 置空: 落盘的分布缺了最要紧的那半边)  -> A24
+  M82 样本被覆盖 (append 改 "w": 当天分布只剩最后一轮, 前面几轮静默消失)      -> A24
+  M83 样本漏进结论 ("_sample" 挂回返回值: results.json 被分布灌胖)            -> A24
+  M84 canary 写了不调用 (main 不问闸门: 档位再准也进不了决策)                       -> A25
+  M85 canary 只认 200 (正常 206 每小时误报成"URL 下架": 狼来了)                -> A25
+  M86 canary 绑 IP (节点坏了伪装成 URL 下架: 假警报比不报更有害)               -> A25
+  M87 canary 走 HTTPS (证书不是给这个域名签的: 真 URL 每小时 SSLCertVerificationError)  -> A25
+  M88 样本路径写回模块常量 (join(BASE) 在 import 时算死: 审计跑 main 重定向不动, 写脏真文件)  -> A24
+  M89 样本路径绕开 BASE (用 __file__ 现拼: 审计的临时目录拦不住, 夹具样本照样落进交付目录)  -> A26
+  M90 无冠军那轮不交样本 (sink 判断写反: 坏日子的分布静默消失, 回放只见好天气)  -> A24
+  M91 canary 把所有 4xx/5xx 当撤版 (403 被限流 / 5xx 偶发都说成文件没了, 照着换 build)  -> C71
+  M92 截断尾部不填 (只加 tail 参数不 extend: l0_tail 恒空, 与"池子刚好 48 个"分不开)  -> A24
+  M93 池子计数不填 (stats 不 update: l0_pool/probed/alive 全是 None, 空 tail 分不清没漏还是没测完)  -> A24
+  M94 canary 闸门恒 ok (档位收集了但不比: 撤版那轮照旧判 dead -> 试热备, 每小时 2GiB 空转)  -> C73
+  M95 classify 无视 floor (分组门槛压成默认 25: Cn2 从 24 掉到 9 判 ok, 相对劣化档恒关)  -> C74
+  M96 load_ips 去掉读侧校验 (池里的内网地址照收: 测出高分 -> 钉进 dnsmasq -> 整组断网)  -> C75
+  M97 粗筛同分按 IP 降序 (回到旧实现: 8MiB 全撞地板, 冠军由字典序决定)  -> C76
+  M98 交付集合漏一行 (PAIRS 去掉 tests/replay.py: push 永远不带它, check 报不出原因)  -> D8
+  M99 粗筛不记并发 (wave_out 不填: 同质节点分数差 4 倍, 样本里却没有『被几路平分』)  -> C77
+  M100 零分不回报 (zero_out 不填: 『预算没测』与『测了是 0』在样本里同形)  -> C78
+  M101 跨度字面量漂移 (watchdog 的 [span] 写 140MiB 而主程序 160: 观测变成假数)  -> C79
+  M102 空 ms_of 回 inf (第二键失效、第三键接管: 握手最快的排到最后)  -> C80
+  M103 replay 默认 None (不带参数就不回放: 翻转恒 0, docstring 却说默认 1.15)  -> C81
+  M104 WANTED 少一键 (回放器不再点名 screen_zero: 三态对称又断一半)  -> C78
+  M105 样本硬写串行撞顶线 (screen_cap 恒 80.0: 4 路下『撞不到』读成『都没到 80』)  -> C82
+  M106 常量把并发摊进节点上限 (线变 20, 实测 P50 21.6 -> capped 恒满)  -> C83
+  M107 生产路径不看并发 (_cap_line 恒等 SPEED_CEIL_MIB: 样本永远记 80.0)  -> C84
 
 用法: python3 tests/selftest_audit.py        退出码 0 = 审计器可信
 """
@@ -95,7 +125,16 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
 AUDIT = os.path.join(HERE, "audit.py")
-FILES = ["xbox-speedtest.py", "watchdog.py", "pool_refresh.py", "nas-README.md"]
+FILES = ["xbox-speedtest.py", "watchdog.py", "pool_refresh.py", "nas-README.md", "deliver.sh"]
+# deliver.sh 必须在这份清单里: 变异目录只有放进来的文件, 而 `D8` / `D-crlf:deliver.sh` 在
+# audit.py 里是 `isfile` 守着的 —— 不在清单里就**静默跳过**, 于是打它自己那两条变异(现在是 M98)
+# 会以「注入点不存在」或 FileNotFoundError 收场。这不是"多复制一个文件", 是让交付脚本本身可被反证。
+#
+# 但 deliver.sh **只存在于本地镜像侧**: 它是推送工具, 不在 deliver.sh 自己的 PAIRS 表里, NAS 上
+# 没有这个文件。所以复制时按"本侧实际有哪些"收口, 拿不到的记进 MISSING, 打它自己的变异按 SKIP 记
+# (不掺进分母), 而不是让整轮自检在第一行就 FileNotFoundError。**在哪一侧缺、缺了哪条变异, 必须
+# 打出来**: 静默缩表比报错更难发现 —— 上一版就是这么把 `FILES` 漏成四个还一声不响的。
+MISSING = [f for f in FILES if not os.path.isfile(os.path.join(SRC, f))]
 # A18(台账倒序)是跨目录断言: 台账在项目上一级, 不在 FILES 里。自检必须显式指路,
 # 否则 audit.py 在 tmp 里找不到它、只能判红 —— 那就成了"自检本身失效"。
 LEDGER = os.path.join(os.path.dirname(SRC), "AI共管台账.md")
@@ -362,6 +401,180 @@ MUTANTS = [
     ("M77", "握手失败当 0ms (ms 非 None 那道门压成 0.0: 死节点升序排第一, 挤掉真节点)", "xbox-speedtest.py", "C68",
      "            if ms is not None:\n                best[ip] = ms\n",
      "            best[ip] = ms if ms is not None else 0.0\n"),
+    # M78/M79 是一对: 同一段 A22 代码的两个方向。M78 证明它抓得到真注解(唯一在 3.8 上会炸的形态),
+    # M79 证明它**不**抓注释 —— 2026-11-07 之前 A22 是全文正则 `竖线 None`, 注释里写一句就假红,
+    # 而假红让 M78 根本写不进来(A22 扫的 selftest 是真实路径, 变异串自己就被判红) -> 那半边永久无覆盖。
+    ("M78", "注解竖线 None 漏检 (pool_refresh.py 写 def f(x: int 竖线 None): 3.8 定义期即 TypeError)",
+     "pool_refresh.py", "A22",
+     'if __name__ == "__main__":\n    main()',
+     'if __name__ == "__main__":\n    main()\n\ndef _probe(x: int | None):\n    return x'),
+    ("M79", "注释被判成代码 (只在 pool_refresh.py 顶部加一行注释写 int 竖线 None: A22 必须仍绿)",
+     "pool_refresh.py", "GREEN",
+     '# -*- coding: utf-8 -*-',
+     '# -*- coding: utf-8 -*-\n# 历史上这里返回 int | None'),
+    # M80: README 11 处把常量值当论据、零断言。改代码不改文档 = 句子照样通顺、结论已经失效。
+    ("M80", "README 数字漂移 (RTT_TOP 48->72 而 README 仍用 48 论证「48 刚好不漏」: 曾是 137 项全绿)",
+     "xbox-speedtest.py", "A23",
+     "RTT_TOP = 48", "RTT_TOP = 72"),
+    # M81-M83 打的是 samples.jsonl 这条新链。三条各自对应一种"看起来落了盘、实际数据废了"的形态:
+    # 丢字段(分布缺最要紧的半边) / 覆盖写(只剩最后一轮) / 漏进结论文件(把 watchdog 读的 results.json 灌胖)。
+    ("M81", "样本丢快测表 (build_sample 的 quick 置空: 落盘的分布缺了最要紧的那半边)",
+     "xbox-speedtest.py", "A24",
+     '"quick": {ip: round(sp, 1) for ip, sp in quick.items()},',
+     '"quick": {},'),
+    ("M82", "样本被覆盖 (append 改 \"w\": 当天分布只剩最后一轮, 前面几轮静默消失)",
+     "xbox-speedtest.py", "A24",
+     'with open(_path, "a", encoding="utf-8") as f:',
+     'with open(_path, "w", encoding="utf-8") as f:'),
+    # M83 换过锚点: 样本改成走 sample_sink(返回值里不再有 _sample), 原来那句 pop 的变异就成了空转 ——
+    # 自测当场报"漏网 M83", 而它漏的不是断言, 是变异自己失去了对象。等价缺陷现在是"把样本又挂回
+    # 返回值": 那样它会跟着 r 进 results.json(main 只 pop 了 ranked/quick/rows/tag_of/_t)。
+    ("M83", "样本漏进结论 (把 \"_sample\" 挂回返回值: results.json 被分布灌胖, watchdog 读的文件变样)",
+     "xbox-speedtest.py", "A24",
+     '"_t": {"screen": round(t_screen, 1), "quick": round(t_quick, 1)}}',
+     '"_t": {"screen": round(t_screen, 1), "quick": round(t_quick, 1)}, "_sample": _smp}'),
+    # M84-M86 打 canary 的三条边: 不调用(等于没加) / 只认 200(正常 206 每小时误报成下架) /
+    # 绑 IP(单台节点坏了伪装成 URL 下架)。后两条都是"能报警但报错", 比不报更能训练人忽略日志。
+    # v2.3.31: 注入点跟着实现走 —— main 里那两行从 `for _cn in CANARY: canary(_cn)` 换成了
+    # `gate, gate_state = canary_gate()`。旧注入串在本轮"注入点不存在"漏网了一次(自检自己失效),
+    # 所以这条现在钉的是**闸门被调用**: 结果接不接得住是 C73 的事, A25 只管"main 有没有真去问"。
+    ("M84", "canary 写了不调用 (main 里闸门没被问过: 档位再准也进不了决策)",
+     "watchdog.py", "A25",
+     "    gate, gate_state = canary_gate()", '    gate, gate_state = "ok", {}  # 变异: 不问闸门'),
+    ("M85", "canary 只认 200 (正常 206 每小时误报成\"URL 下架\": 狼来了)",
+     "watchdog.py", "A25",
+     "ok = st in (200, 206)", "ok = st in (200,)"),
+    ("M86", "canary 绑 IP (单台节点坏了伪装成 URL 下架: 假警报比不报更有害)",
+     "watchdog.py", "A25",
+     "conn = http.client.HTTPConnection(DOMAIN[name], timeout=DL_TIMEOUT)",
+     "conn = BindIPConn(DOMAIN[name], \"1.1.1.1\", DL_TIMEOUT)"),
+    # M87 是真机踩出来的: 一开始写的是 HTTPSConnection, NAS 上一跑, 真 URL 直接
+    # SSLCertVerificationError(Hostname mismatch) —— 证书不是给 dlassets.xboxlive.cn 签的。
+    # 下载路径是明文 HTTP + Host 头, 从没做过 TLS 校验; canary 用 HTTPS 等于每小时报一次假警。
+    ("M87", "canary 走 HTTPS (真 URL 每小时 SSLCertVerificationError: 给体检加了体检对象不遵守的门)",
+     "watchdog.py", "A25",
+     "conn = http.client.HTTPConnection(DOMAIN[name], timeout=DL_TIMEOUT)",
+     "conn = http.client.HTTPSConnection(DOMAIN[name], timeout=DL_TIMEOUT)"),
+    # M88/M89 打的是 v2.3.28 真踩出来的那条: 样本路径**必须**在调用时用 BASE 拼。
+    # M88 是原缺陷形态(模块常量, import 时算死) —— 审计里 38 个跑 main 的用例改 BASE 也重定向不动,
+    # 夹具样本(9.9.9.9/1.0ms)全进真文件; 靠人眼在 39 行里挑不出来, 因为假行字段和真行长得一样。
+    ("M88", "样本路径写回模块常量 (import 时算死: 审计改 BASE 重定向不动, 38 行夹具样本混进真文件)",
+     "xbox-speedtest.py", "A24",
+     'BASE = os.path.dirname(os.path.abspath(__file__))',
+     'BASE = os.path.dirname(os.path.abspath(__file__))\nSAMPLES = os.path.join(BASE, "samples.jsonl")'),
+    # M89 是**绕过** BASE 的形态(__file__ 现拼): A24 的文本形态照样满足, 只有事后对账(A26)能抓 ——
+    # 这条存在的意义就是证明 A26 不是装饰: 断言"字节没变", 不依赖"用例记得重定向"这种自觉。
+    ("M89", "样本路径绕开 BASE (用 __file__ 现拼: 临时目录拦不住, 夹具样本落进交付目录)",
+     "xbox-speedtest.py", "A26",
+     '_path = os.path.join(BASE, "samples.jsonl")',
+     '_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples.jsonl")'),
+    # M90: sink 判断写反 = 只在"没有 sink"时交样本。好日子里看着照常, 缺的恰好是坏日子 ——
+    # 而"坏日子没留样本"正是回放最大的失真来源(会得出"这网一直很稳")。
+    ("M90", "无冠军那轮不交样本 (sink 判断写反: 坏日子的分布静默消失)",
+     "xbox-speedtest.py", "A24",
+     "    if sample_sink is not None:" + chr(10) + "        sample_sink.append(_smp)",
+     "    if sample_sink is None:" + chr(10) + "        sample_sink = [_smp]"),
+    # M91: 把 401/403/429 与 5xx 一起当 404 报 —— 运维会照着"换 build"动手, 而真因可能是限流。
+    ("M91", "canary 把所有 4xx/5xx 当撤版 (403 被限流 / 5xx 偶发都说成文件没了)",
+     "watchdog.py", "C71",
+     "        if st in (404, 410):",
+     "        if st >= 400:"),
+    # M92/M93 是"只加断言不加反证"的解药: 这两行删掉之后 A24 的 (g) 仍然会红,
+    # 但如果没有它们, 自检只能证明"断言写着", 证明不了"断言还活着"。
+    ("M92", "截断尾部不填 (只加 tail 参数不 extend: l0_tail 恒空, 与\"池子刚好 48 个\"分不开)",
+     "xbox-speedtest.py", "A24",
+     "        tail.extend([round(_m, 1), _ip] for _m, _ip, _t in out[top:top + 8])",
+     "        pass  # 变异: 只加签名不填 tail"),
+    ("M93", "池子计数不填 (stats 不 update: 空 tail 分不清\"没漏\"还是\"没测完\")",
+     "xbox-speedtest.py", "A24",
+     '        stats.update({"pool": len(uniq), "probed": done, "alive": len(best)})',
+     "        pass  # 变异: 不交代池子大小"),
+    # ---- M94..M97 对应 v2.3.31 新增的四条断言(C73/C74/C75/C76) ----
+    # 这四条断言的共同点: 被测的东西**在旧口径下全都"看起来正常"**。
+    #   撤版那天: 闸门恒 ok -> 照旧判 dead -> 试热备 -> 每小时 2GiB 打在一个 404 上;
+    #   Cn2 门槛 25: classify(9.0, 23.9) 返回 ok, 从 24 掉到 9 叫"稳定";
+    #   读侧不校验: 内网地址被测出高分 -> 被钉进 dnsmasq -> 整组断网;
+    #   同分按 IP 排: 80MiB/s 以上全撞地板, 谁是冠军由字典序决定。
+    # 没有这四行, C73~C76 只是"写着", 证明不了"还活着"。
+    ("M94", "canary 闸门恒 ok (档位收集了但不进判断: 撤版那轮照旧判 dead -> 试热备 -> 每小时 2GiB 空转)",
+     "watchdog.py", "C73",
+     '    for want in ("gone", "denied", "unknown"):',
+     '    for want in ("__never__",):  # 变异: 三档一个都不比, 恒落到 return "ok"'),
+    ("M95", "classify 无视 floor (分组门槛被压成默认 25: Cn2 从 24 掉到 9 判 ok, 相对劣化档恒关)",
+     "watchdog.py", "C74",
+     "    lim = DEGRADE_MIN_RECORD_DEFAULT if floor is None else floor",
+     "    lim = DEGRADE_MIN_RECORD_DEFAULT  # 变异: 不看传进来的分组门槛"),
+    ("M96", "load_ips 去掉读侧校验 (池文件里的内网地址照收: 被测出高分 -> 钉进 dnsmasq -> 整组断网)",
+     "xbox-speedtest.py", "C75",
+     "        why = ip_reject_reason(ip)",
+     "        why = None  # 变异: 只校验写侧, 读侧全收"),
+    # M97 必须还原成**旧的真身**: 旧实现是 `sorted(((-sp, ip) ...), reverse=True)`,
+    # 也就是同分时按 IP **降序**。写成升序会与「按 ms 排」偶然同序, C76 照样绿 = 假漏网。
+    ("M97", "粗筛同分按 IP 降序 (回到旧实现: 8MiB 全撞 SPEED_MIN_EL 地板, 冠军由字典序决定)",
+     "xbox-speedtest.py", "C76",
+     '''    ranked = sorted(((-sp, _k2(ip), ip) for ip, sp in speeds.items() if sp > 0))
+    return [(-neg, ip) for neg, _ms, ip in ranked]
+''',
+     '''    ranked = sorted(((-sp, ip) for ip, sp in speeds.items() if sp > 0), reverse=True)
+    return [(-neg, ip) for neg, ip in ranked]
+'''),
+    # M98: 交付集合漏一项。D8 原本的 `_want` 只数三个手抄的 tests 名, 于是 replay.py
+    # 「README 清单里有、PAIRS 里没有」这件事两边都不报 —— push 永远不带它, 而 check 只会红
+    # 在一条指不出原因的单侧项上。这条变异钉住的是「交付集合只有一个来源」。
+    ("M98", "交付集合漏一行 (PAIRS 去掉 tests/replay.py: push 永远不带它, check 报不出原因)",
+     "deliver.sh", "D8",
+     '  "tests/replay.py:$RD/tests/replay.py"\n', ""),
+
+    # ---- M99..M104 对应 v2.3.32 新增的五条断言(C77/C78/C79/C80/C81) ----
+    # 这一批的共同点: 缺陷都在**样本/日志这一侧**, 不影响任何一条决策分支 —— 也就是说
+    # 只看"跑出来的冠军对不对"永远发现不了。它们各自的代价都是"半年后想归因时才发现没记"。
+    # M99 并发不记: 12 个同质节点的分数差 4 倍, 而样本里没有"被几路平分过"这一列 -> 无法归因
+    # M100 零分不回报: "预算没测"与"测了是 0"在样本里同形(键不存在) -> 下一轮该补测还是该拉黑, 分不清
+    # M101 span 字面量漂移: 主程序改跨度, [span] 照旧念 160 -> 观测本身变成假数
+    # M102 空 ms_of: 第二键整段变 inf, 第三键(IP 字符串)接管 -> 握手最快的排到最后, 而 L0 全不通时正好走这条路
+    # M103 replay 默认 None: 不带参数就不回放, 翻转恒 0, 而 docstring 说"默认 1.15"
+    # M104 WANTED 少一键: 回放器不再点名 screen_zero -> 三态那条对称又断了一半
+    ("M99", "粗筛不记并发 (wave_out 不填: 同质节点分数差 4 倍, 而样本里没有『被几路平分』的凭证)",
+     "xbox-speedtest.py", "C77",
+     '        wave_out.update(dict((ip, capped[ip].get("wave")) for ip in speeds))',
+     '        pass  # 变异: 并发档位不回报'),
+    ("M100", "零分不回报 (zero_out 不填: 『预算没测』与『测了是 0』在样本里同形, 含义正相反)",
+     "xbox-speedtest.py", "C78",
+     "    if zero_out is not None:\n        zero_out.extend(zero)",
+     "    if zero_out is not None:\n        pass  # 变异: 0 分不回报, 与『没测到』混在一起"),
+    ("M101", "跨度字面量漂移 (watchdog 的 [span] 写 140MiB 而主程序仍是 160: 观测变成假数)",
+     "watchdog.py", "C79",
+     "xbox-speedtest 的 RANGE_SPAN 是 160MiB", "xbox-speedtest 的 RANGE_SPAN 是 140MiB"),
+    ("M102", "空 ms_of 回 inf (第二键整段失效、第三键接管: 握手最快的排到最后, 而 L0 全不通时正好走这条路)",
+     "xbox-speedtest.py", "C80",
+     '        _k2 = lambda ip: pos.get(ip, len(pos))              # noqa: E731',
+     '        _k2 = lambda ip: float("inf")                       # 变异: 退回 inf'),
+    ("M103", "replay 默认 None (不带参数就不回放: 翻转恒 0, 而 docstring 说『默认 1.15』)",
+     "tests/replay.py", "C81",
+     "    new_ratio = DEFAULT_RATIO", "    new_ratio = None  # 变异: 不指定就不回放"),
+    ("M104", "WANTED 少一键 (回放器不再点名 screen_zero: 粗筛三态那条对称又断了一半)",
+     "tests/replay.py", "C78",
+     '"screen", "screen_capped", "screen_skip", "screen_zero", "screen_wave",',
+     '"screen", "screen_capped", "screen_skip", "screen_wave",'),
+
+    # ---- M105..M107 对应 v2.3.33 新增的三条断言(C82/C83/C84) ----
+    # 共同点: 都是「撞顶线是**每路**的」这件事被写成了别的口径。三种写法都会让
+    # `screen_capped` 这一列从「有信息的空」退化成「没信息的空/满」, 而所有决策分支照常跑完。
+    # M105 样本硬写串行 80: 读样本的人会以为「4 路下没撞顶」= 节点都没到 80, 其实这一档撞不到
+    # M106 常量把并发摊进去: 4 路下这条线变 20, 而实测 P50 就是 21.6 -> 一半以上节点"撞顶", capped 恒满
+    # M107 test_pool 不看 wave: 生产路径恒记 80.0, 与 M105 一样抹掉档位, 但 C82 仍绿(它只测 build_sample)
+    ("M105", "样本硬写串行撞顶线 (build_sample 的 screen_cap 恒 80.0: 4 路下『撞不到』读成『都没到 80』)",
+     "xbox-speedtest.py", "C82",
+     '        "screen_cap": (round(screen_cap, 1) if screen_cap else None),',
+     '        "screen_cap": 80.0,   # 变异: 不看并发档位, 硬写串行线'),
+    ("M106", "常量把并发摊进节点上限 (SPEED_CEIL_MIB 再除以 4: 线变 20, 实测 P50 21.6 -> capped 恒满)",
+     "xbox-speedtest.py", "C83",
+     'SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / SPEED_MIN_EL   # 80.0',
+     'SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / (SPEED_MIN_EL * 4)   # 变异: 把每路线摊成节点线'),
+    ("M107", "生产路径不看并发 (test_pool 的 _cap_line 恒等于 SPEED_CEIL_MIB: 样本永远记 80.0)",
+     "xbox-speedtest.py", "C84",
+     "    _cap_line = (SPEED_CEIL_MIB / _wave_max) if _wave_max else SPEED_CEIL_MIB",
+     "    _cap_line = SPEED_CEIL_MIB   # 变异: 不看 max(screen_wave)"),
 ]
 
 
@@ -375,16 +588,25 @@ def run_audit(d, extra_env=None):
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
+def _copy_all(dst):
+    """把本侧实际存在的交付物复制进变异目录, 缺的跳过(已在 MISSING 里公告过)。"""
+    for f in FILES:
+        p = os.path.join(SRC, f)
+        if os.path.isfile(p):
+            shutil.copy(p, dst)
+
 def main():
     tmp = tempfile.mkdtemp(prefix="mutant_")
     fails = []
     skipped = []
     try:
+        if MISSING:
+            # NAS 侧就是这样: deliver.sh 是本地推送工具, 不在 PAIRS 里, 那边没有这个文件。
+            print("NOTE 本侧缺少交付物: %s | 打它的变异按 SKIP 记(不进分母)" % ",".join(MISSING))
         # 基线: 原样复制必须全过(否则后面所有判断都没意义)
         base = os.path.join(tmp, "pristine")
         os.makedirs(base)
-        for f in FILES:
-            shutil.copy(os.path.join(SRC, f), base)
+        _copy_all(base)
         rc, out = run_audit(base)
         ok = rc == 0 and "全过" in out
         print(("PASS" if ok else "FAIL") + " 基线: 未经修改的交付物审计全过")
@@ -393,10 +615,18 @@ def main():
             print(out[-1500:])
 
         for mid, desc, fn, expect_cid, old, new in MUTANTS:
-            if mid in ("M68", "M71") and sys.version_info < (3, 9):
-                # 本机就是 py3.8 时, 这两条变异的"漂移"由解释器自己保证被发现:
+            if fn in MISSING:
+                # 打的是本侧不存在的文件: 复制都复制不了, 更谈不上"改动后必须红"。
+                # 记 SKIP 而不是 FAIL —— 缺文件是交付集合的侧别差异, 不是审计器的漏网。
+                skipped.append(mid)
+                print("SKIP %s %s | 本侧没有 %s(%s), 该变异只能在有它的那一侧跑"
+                      % (mid, desc, fn, "NAS 侧不含本地推送工具"))
+                continue
+            if mid in ("M68", "M71", "M78") and sys.version_info < (3, 9):
+                # 本机就是 py3.8 时, 这三条变异的"漂移"由解释器自己保证被发现:
                 # M68 是**硬语法错误**(match 语句), A 段 load(pool_refresh) 先崩(A0/B0/C0 红);
-                # M71 是**注解求值即炸**(3.8 里 list 不可下标), 同样崩在 import 那一行。
+                # M71 是**注解求值即炸**(3.8 里 list 不可下标), 同样崩在 import 那一行;
+                # M78 同理(3.8 对 `int | None` 求值即 TypeError: unsupported operand)。
                 # 两者都走不到 A22 —— 也就是说 A22 在 3.8 上没有额外语义, 这条变异在此无意义。
                 # 它们只在 3.9+ 的解释器上才需要 A22 提前拦。NAS 实测暴露过 M68 这一形态:
                 # 本地 68/68, NAS 报"漏网"(实际红 A0,B0,C0) —— 记账口径按 SKIP 计, 不掺进分母。
@@ -415,12 +645,17 @@ def main():
                     old, new = "测速主程序（%s）" % _cur.group(1), "测速主程序（v2.3.8）"
             d = os.path.join(tmp, mid)
             os.makedirs(d)
-            for f in FILES:
-                shutil.copy(os.path.join(SRC, f), d)
+            _copy_all(d)
+            if fn.startswith("tests/"):
+                # 打 tests/ 里那些文件的变异(比如 replay.WANTED), 必须把它们**放进变异目录** ——
+                # audit 对 tests/* 默认走真实路径(见 A22 的注释), 不复制过来就等于改了个没人读的副本。
+                os.makedirs(os.path.join(d, "tests"))
+                shutil.copy(os.path.join(HERE, os.path.basename(fn)),
+                            os.path.join(d, "tests", os.path.basename(fn)))
             extra_env = {}
             if fn == "LEDGER" and mid == "M60":
                 # 引用假账: 只把台账头部那处检查编号改错, 条目内容与排序**一个字节不动**。
-                # 交付物(FILES 那四个)也没动, 所以绿/红只可能来自 A19 —— 这条断言唯一诚实的验法。
+                # 交付物(FILES 里那几个)也没动, 所以绿/红只可能来自 A19 —— 这条断言唯一诚实的验法。
                 led = os.path.join(tmp, "ledger_%s.md" % mid)
                 L = open(LEDGER, encoding="utf-8").read().split("\n")
                 _hit = 0
@@ -437,7 +672,7 @@ def main():
                 extra_env["XBOX_LEDGER"] = led
             elif fn == "LEDGER":
                 # 这一族打的都是台账自己: 把最新一条挪到文件底部 / 换一种写法 / 砍掉历史 / 头部写句真话。
-                # 交付物(FILES 那四个)一个字节不动, 所以红只可能来自 A18/A19 —— 这也是这些断言
+                # 交付物(FILES 里那几个)一个字节不动, 所以红只可能来自 A18/A19 —— 这也是这些断言
                 # 唯一诚实的验法。M59/M64/M66 是"必须红", M65 是"必须仍绿"(真话不该被判成假账)。
                 led = os.path.join(tmp, "ledger_%s.md" % mid)
                 L = open(LEDGER, encoding="utf-8").read().split("\n")

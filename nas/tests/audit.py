@@ -25,14 +25,17 @@
 import argparse
 import ast
 import contextlib
+import hashlib
 import importlib.util
 import inspect
 import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
+import threading
 import time
 
 FAIL_CONSTS = (False, None, 0, 0.0, "")
@@ -55,6 +58,8 @@ FAILURE_EXITS = {
     ("watchdog.py", "router_cmd"): 3,               # v2.3.19: 同上, 三元 else None
     ("watchdog.py", "router_apply"): 2,             # uci 失败、restart 失败
     ("watchdog.py", "steady"): 3,
+    ("watchdog.py", "canary"): 2,                   # v2.3.28: 连不上 -> False, 非 2xx -> False
+    ("xbox-speedtest.py", "write_samples"): 1,      # v2.3.28: 落盘失败 -> 打 warn 并返回已写行数
     ("watchdog.py", "load_hotspares"): 1,           # results.json 读不出
     ("watchdog.py", "load_record"): 7,              # v2.3.5: 多一层 pinned_ip 匹配容错(原 6)
     ("watchdog.py", "quick_fix"): 1,                # 无达标热备 -> None
@@ -89,6 +94,8 @@ FAILURE_TESTS = {
     ("watchdog.py", "router_cmd"): ["C9", "C10"],
     ("watchdog.py", "router_apply"): ["C7", "C8", "C9", "C10"],
     ("watchdog.py", "steady"): ["C1"],
+    ("watchdog.py", "canary"): ["C71"],
+    ("xbox-speedtest.py", "write_samples"): ["C72"],
     ("watchdog.py", "load_hotspares"): ["C13"],
     ("watchdog.py", "load_record"): ["C13", "C26", "C65"],
     ("watchdog.py", "quick_fix"): ["C3", "C5", "C6"],
@@ -116,6 +123,33 @@ def chk(cid, title, cond, detail=""):
     return cond
 
 
+class _OffResp(object):
+    """canary 离线桩的响应: 200/206 都算活, 让 canary 静默、决策链不受影响。"""
+    status = 206
+    def close(self):
+        pass
+
+
+class _OffConn(object):
+    """canary 离线桩的连接对象。同时顶上 `http.client.HTTPConnection` 与 `BindIPConn` 两个位置:
+    前者是正常路径, 后者是"绑 IP"那条路 —— 变异 M86 一注入就从后者出门。"""
+    def __init__(self, host=None, *a, **k):
+        pass
+    def request(self, method, path, headers=None):
+        pass
+    def getresponse(self):
+        return _OffResp()
+    def close(self):
+        pass
+
+
+def _offline_http():
+    """给 watchdog 模块用的 `http` 替身(只需要 .client.HTTPConnection / .HTTPSConnection)"""
+    return type("_OffHTTP", (object,),
+                {"client": type("_OffClient", (object,),
+                                {"HTTPConnection": _OffConn, "HTTPSConnection": _OffConn})})
+
+
 def load(path, tag):
     """每次给唯一模块名, 避免同一轮里多次加载互相污染(桩打歪曾让冒烟骗过我一次)
 
@@ -134,9 +168,24 @@ def load(path, tag):
     if hasattr(m, "rtt_rank") and callable(getattr(m, "rtt_rank", None)):
         m._rtt_rank_real = m.rtt_rank
 
-        def _rtt_stub(rows, port=443, top=10 ** 9, budget=0.0):
-            return [(float(i), ip, tag) for i, (ip, tag) in enumerate(rows)]
+        def _rtt_stub(rows, port=443, top=10 ** 9, budget=0.0, tail=None, stats=None):
+            out = [(float(i), ip, tag) for i, (ip, tag) in enumerate(rows)]
+            # 桩也要填 tail/stats: 生产调用点传了这两个出口, 桩不填的话 l0_tail 恒空、
+            # l0_pool 恒 None —— 那让 A24 的两条新断言变成"恒真", 等于没测。
+            if tail is not None:
+                tail.extend(round(r[0], 1) for r in out[top:top + 8])
+            if stats is not None:
+                stats.update({"pool": len(rows), "probed": len(rows), "alive": len(rows)})
+            return out[:top]
         m.rtt_rank = _rtt_stub
+    if hasattr(m, "canary") and hasattr(m, "BindIPConn"):
+        # v2.3.31: `watchdog.main` 现在每小时真的走一次 canary_gate()。审计里有十几条用例
+        # 用各自的桩跑 main(冷却/止血/重测/跨组), 每条都会因此去 HEAD 一个真 URL ——
+        # 有网时几十毫秒看不出来, 没网或变异把 canary 改成绑 IP 时每条卡满 DL_TIMEOUT=12s,
+        # NAS 侧实测把 selftest 的 300s subprocess 超时跑穿(M86)。
+        # 这里集中桩住**两条出门的路**(http.client 与 BindIPConn), 需要控制状态码的用例
+        # (C71/C73)在 load 之后自行覆盖。审计必须离线可跑, 不能靠"本机恰好能连上"。
+        m.http, m.BindIPConn = _offline_http(), _OffConn
     return m
 
 
@@ -148,6 +197,28 @@ def capture(fn, *a, **kw):
     with contextlib.redirect_stdout(buf):
         r = fn(*a, **kw)
     return r, buf.getvalue()
+
+
+# 运行产物(只在真机上生成, 不进仓库): 审计不许碰其中任何一个字节。
+# 2026-11-07 实测: v2.3.28 把 samples.jsonl 路径写成模块常量, 一次 audit 通过 st_run 跑 38 次 main,
+# 每次都往**真**文件 append 一行夹具样本(9.9.9.9 / 1.0ms) —— 39 行里只有 1 行是真机测出来的。
+# 靠人眼盯「哪些用例改了 BASE」不成立(同类路径还有 results/speed.log/.last_retest/run.log),
+# 所以这里改成事后对账: 跑前跑后各拍一次 (size, mtime_ns, md5), 不讲道理、只讲事实。
+RUN_PRODUCTS = ("samples.jsonl", "results.json", "speed.log", ".last_retest", "run.log")
+
+
+def run_products_state(d):
+    st = {}
+    for n in RUN_PRODUCTS:
+        p = os.path.join(d, n)
+        try:
+            with open(p, "rb") as f:
+                blob = f.read()
+            s = os.stat(p)
+            st[n] = (len(blob), s.st_mtime_ns, hashlib.md5(blob).hexdigest())
+        except OSError:
+            st[n] = None       # 不存在也算一种状态: 审计把它造出来同样是污染
+    return st
 
 
 def readme_name(d):
@@ -200,7 +271,12 @@ def audit_static(d):
         ("STEADY_ROUNDS 3", xst.STEADY_ROUNDS, 3),
         ("QUICK_MAX_SEC 25", xst.QUICK_MAX_SEC, 25.0),
         ("STEADY_MAX_BYTES 256MiB", xst.STEADY_MAX_BYTES, 256 * 1024 * 1024),
-        ("DEGRADE_MIN_RECORD 25", wd.DEGRADE_MIN_RECORD, 25.0),
+        # v2.3.31: 门槛分组后这里改为钉两张表 —— Cn1 仍是 25(它的记录值在 100 量级),
+        # Cn2 是 10(那组的记录区间 21~24, 用 25 等于永久关掉相对劣化档)。
+        # 原来这里把 25.0 当字面值钉死, 等于把"错误值"写成了契约。
+        ("DEGRADE_MIN_RECORD Cn1=25", wd.DEGRADE_MIN_RECORD.get("Cn1"), 25.0),
+        ("DEGRADE_MIN_RECORD Cn2=10", wd.DEGRADE_MIN_RECORD.get("Cn2"), 10.0),
+        ("SPEED_MIN_EL 0.1", xst.SPEED_MIN_EL, 0.1),     # 8MiB/0.1s = 80MiB/s 天花板
         ("RETEST_COOLDOWN 3 小时", wd.RETEST_COOLDOWN, 3 * 3600),   # v2.3.15: 冷却必须跨过 cron 周期
     ]
     diffs = ["%s: code=%r" % (n, v) for n, v, exp in pairs if v != exp]
@@ -441,10 +517,14 @@ def audit_static(d):
     # 变异目录只复制 FILES 那四个, tests/ 不在里面, 按 d 找会全部"文件不存在"而假红。
     _self_dir = os.path.dirname(os.path.abspath(__file__))
     _py38_st = os.environ.get("XBOX_SELFTEST") or os.path.join(_self_dir, "selftest_audit.py")
+    # v2.3.31: `tests/replay.py` 也进 NAS 侧交付(README 清单里有它), 所以它同样得被 3.8 兼容钉住。
+    # 走**真实路径**而不是 `d`: 变异目录只复制 FILES 那几个, tests/ 不在里面 —— 按 d 找会
+    # 「文件不存在」, 于是每个变异体都红在 A22, 等于这条断言被所有变异体"抓到", 也就没意义了。
     for _f, _p in (("xbox-speedtest.py", os.path.join(d, "xbox-speedtest.py")),
                    ("watchdog.py", os.path.join(d, "watchdog.py")),
                    ("pool_refresh.py", os.path.join(d, "pool_refresh.py")),
                    ("tests/audit.py", os.path.abspath(__file__)),
+                   ("tests/replay.py", os.path.join(_self_dir, "replay.py")),
                    ("tests/selftest_audit.py", _py38_st)):
         if not os.path.isfile(_p):
             _py38_bad.append("%s: 文件不存在" % _f)
@@ -467,9 +547,28 @@ def audit_static(d):
                                r"^\s*(?:from|import)\s+zoneinfo", _s, re.M):
             _py38_bad.append("%s:%d -> %s" % (
                 _f, _s.count("\n", 0, _mm.start()) + 1, _mm.group(0).strip()[:24]))
-        # 注解里的 `X 竖线 None`: 3.10 才合法, 3.8 求值即 TypeError; ast 看不出(语法是 BinOp)。
-        for _mm in re.finditer(r"\|\s*None\b", _s):
-            _py38_bad.append("%s:%d -> 注解用 竖线 None" % (_f, _s.count("\n", 0, _mm.start()) + 1))
+        # 注解里的 `X 竖线 None`: PEP 604 属于 3.10, 3.8 定义期即 TypeError。
+        # feature_version=(3,8) 拦不住它 —— 语法上就是个 BitOr BinOp(实测 3.13 的 ast 照收)。
+        # **只能看注解位置**: 全文正则会把注释/字符串里写的 `int 竖线 None` 判红(2026-11-07 实测假红),
+        # 而假红会挡掉反证——把真注解写进变异清单时, A22 扫的是 selftest 的真实路径,
+        # 变异串自己就被当代码判红, 于是这半边永久没有变异钉住。宽断言不会让检查更严, 它让检查无法被证明。
+        for _nd in ast.walk(_tree):
+            _anns = []
+            if isinstance(_nd, ast.arg) and _nd.annotation is not None:
+                _anns.append(_nd.annotation)
+            elif isinstance(_nd, (ast.FunctionDef, ast.AsyncFunctionDef)) and _nd.returns is not None:
+                _anns.append(_nd.returns)
+            elif isinstance(_nd, ast.AnnAssign):
+                _anns.append(_nd.annotation)
+            for _a in _anns:
+                for _b in ast.walk(_a):
+                    if not (isinstance(_b, ast.BinOp) and isinstance(_b.op, ast.BitOr)):
+                        continue
+                    if any((isinstance(_x, ast.Constant) and _x.value is None)
+                           or (isinstance(_x, ast.Name) and _x.id == "None")
+                           for _x in (_b.left, _b.right)):
+                        _py38_bad.append("%s:%d -> 注解用 竖线 None(3.10+ 语法, 3.8 定义期即 TypeError)"
+                                         % (_f, _b.lineno))
     chk("A22", "py3.8 兼容(NAS=3.8.10 / 本地=3.13): 语法与 3.9+ API 都在本地钉住, 不靠上机才发现",
         not _py38_bad, "不兼容=%s" % _py38_bad[:6])
 
@@ -497,6 +596,205 @@ def audit_static(d):
     chk("A17", "稳态计时起点延迟到首次响应头之后(TCP 建连不算吞吐)",
         "t0 = None" in fn_steady and i_resp >= 0 and i_t0 > i_resp,
         "resp@%d t0@%d" % (i_resp, i_t0))
+
+    # A23: README 把常量数值当**论据**(不止是举例), 却没有任何断言把那个数字和代码连起来。
+    # 2026-11-07 实测: RTT_TOP 48 -> 72, 137 项全绿, 而 README 还在用 48 推「48 刚好不漏」。
+    # 数字腐烂比措辞腐烂危险 —— 措辞错了读起来别扭, 数字错了句子照样通顺。
+    # 边界与 A19 同一条: 只扫「## 版本历史」之前。历史里 RETEST_TIMEOUT=5400 之类是当时的记账,
+    # 拿历史判现状就是拿记账当代码。dict 类阈值(WIN_RATIO={"Cn1":1.15,...})本正则不碰 ——
+    # 覆盖率只写能兑现的那部分, 不假装盖住。
+    _consts = {}
+    for _mod in (xst_bs, wdm_bs, load(os.path.join(d, "pool_refresh.py"), "prf_a23")):
+        for _k, _v in vars(_mod).items():
+            if _k.isupper() and isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                _consts[_k] = float(_v)
+    _rdt = open(os.path.join(d, readme_name(d)), encoding="utf-8").read()
+    _rhi = _rdt.find("\n## 版本历史")
+    if _rhi > 0:
+        _rdt = _rdt[:_rhi]
+    _drift = []
+    for _mm in re.finditer(r"\b([A-Z][A-Z0-9_]{3,})\s*=\s*(\d+(?:\.\d+)?)\b", _rdt):
+        _k, _v = _mm.group(1), float(_mm.group(2))
+        if _k in _consts and abs(_consts[_k] - _v) > 1e-9:
+            _drift.append("%s README=%s 代码=%g" % (_k, _mm.group(2), _consts[_k]))
+    chk("A23", "README 里 `常量=数值` 必须等于代码真值(dict 类阈值不在本断言范围)",
+        not _drift, "漂移=%s" % _drift[:6])
+
+    # A24: samples.jsonl —— 闭环样本。results.json 只留**结论**(冠军+热备), 一轮几百个测量值
+    # 原本全丢在 stdout 里: WIN_RATIO/REPLACE_MIN/DEGRADE_RATIO 只有 n=1 的依据, watchdog 判
+    # degraded 也只能拿一个数跟单次实测比(同节点单次实测差 4 倍)。这条钉七件, 每件都有反证:
+    #   (a) build_sample 是纯函数且字段齐全 —— M81 把 quick 表删空
+    #   (b) 落盘是 append —— M82 改成 "w"(覆盖 = 当天分布只剩最后一轮)
+    #   (c) 样本不进 results.json —— M83 把 "_sample" 挂回返回值(它会跟着 r 进 results.json)
+    #   (d) 路径调用时用 BASE 拼 —— M88 模块常量 / M89 用 __file__ 绕开 BASE
+    #   (e) 样本带**判定输入** st_cand/st_cur/wr —— 否则回放只能正则抠 router 的散文
+    #   (f) 坏日子(快测全 0)仍留 1 行且仍返回 None —— M90 把 sink 判断写反
+    #   (g) 截断尾部与池子计数真的被填 —— M92 删 tail.extend / M93 删 stats.update
+    # 纯函数那部分是真调用, 不是数文本: 取整/标签去空白都在语义里, 改一处就该红。
+    _xs = open(os.path.join(d, "xbox-speedtest.py"), encoding="utf-8").read()
+    _a24 = []
+    _bs = getattr(xst_bs, "build_sample", None)
+    if not callable(_bs):
+        _a24.append("build_sample 不存在")
+    else:
+        try:
+            _row = _bs("Cn1", 6.2, [(11.0, "1.1.1.1", " 广东电信 "), (9.5, "2.2.2.2", "")],
+                       [(103.6, "1.1.1.1")], {"1.1.1.1": 103.57}, {"1.1.1.1": " 广东电信 "},
+                       [[19.3, "9.9.9.9"], [20.1, "9.9.9.8"]], {"pool": 274, "probed": 274, "alive": 60},
+                       screen_capped=["8.8.8.8"], quick_skip=["7.7.7.7"])
+        except Exception as _e:
+            _row = None
+            _a24.append("build_sample 调用失败: %s" % _e)
+        if isinstance(_row, dict):
+            _miss = [k for k in ("ts", "group", "l0", "screen", "quick", "t_l0",
+                                 "l0_tail", "l0_pool", "l0_probed", "l0_alive",
+                                 "screen_capped", "quick_skip") if k not in _row]
+            if _miss:
+                _a24.append("缺字段 %s" % _miss)
+            _l0 = _row.get("l0") or []
+            # 这条**不**证明 l0 是升序的 —— 夹具故意给降序 (11.0, 9.5), 断言要求"原样保留",
+            # 因此它证明的是「build_sample 不重排」。排序本身由 C68 钉(拿真 rtt_rank 跑)。
+            # v2.3.29 之前这里注释写的是"顺序是语义: l0 按 ms 升序", 比断言说的多 —— 那种注释
+            # 会让下一个人以为删掉 sorted 会被 A24 抓住, 而实际抓它的是 C68。
+            if [r[1] for r in _l0[:2]] != ["1.1.1.1", "2.2.2.2"]:
+                _a24.append("l0 被重排/为空(断言只要求原样保留, 排序归 C68): %r" % (_l0[:2],))
+            elif _l0[0][2] != "广东电信":
+                _a24.append("l0 标签没去空白: %r" % (_l0[0],))
+            # v2.3.31: 尾部必须**带 IP**。旧断言只要求长度是 2(裸 ms), 那证明不了"第 49 名是谁";
+            # 而"漏了个更近的节点"这件事, 恰恰只能靠 IP 去补测/去论证 48 该不该调大。
+            if _row.get("l0_tail") != [[19.3, "9.9.9.9"], [20.1, "9.9.9.8"]]:
+                _a24.append("l0_tail 丢了 IP 或被改写: %r(裸 ms 回答不了『漏的是谁』)"
+                            % (_row.get("l0_tail"),))
+            _st24 = (_row.get("l0_pool"), _row.get("l0_probed"), _row.get("l0_alive"))
+            if _st24 != (274, 274, 60):
+                _a24.append("l0_pool/probed/alive 没落进样本: %r" % (_st24,))
+            if _row.get("screen_capped") != ["8.8.8.8"]:
+                _a24.append("screen_capped 没落进样本: %r(80.0 是下界还是精确值就分不清了)"
+                            % (_row.get("screen_capped"),))
+            if _row.get("quick_skip") != ["7.7.7.7"]:
+                _a24.append("quick_skip 没落进样本: %r(『预算跳过』与『测了是 0』同形)"
+                            % (_row.get("quick_skip"),))
+            _q = (_row.get("quick") or {}).get("1.1.1.1")
+            if not isinstance(_q, (int, float)) or abs(_q - 103.6) > 1e-9:
+                _a24.append("quick 丢了或没取整: %r" % (_row.get("quick"),))
+        elif _row is not None:
+            _a24.append("build_sample 返回值不是 dict")
+    if 'open(_path, "a"' not in _xs:
+        _a24.append('落盘不是 append 形态 open(_path, "a")')
+    # 样本走 sink 参数直接进 samples 列表, 不塞进 test_pool 的返回值 —— 塞进去就得把
+    # `return None` 改成 dict, 而那是这条链上唯一的失败出口(B1 棘轮钉着它)。
+    if '"_sample"' in _xs:
+        _a24.append('"_sample" 又挂在返回值上了(要么漏进 results.json, 要么把失败出口改成成功形态)')
+    if "sample_sink" not in _xs:
+        _a24.append("test_pool 没接 sample_sink: 无冠军那几轮不会留下样本")
+    # (e) 样本要能回答"阈值该不该调", 就必须带判定输入(st_cand 对 st_cur*wr)。
+    #     只有结论文案的话, 回放得先用正则去抠「kept (steady 103.6 < cur 87.9*1.3)」,
+    #     而切换分支的文案里一个数都没有(写的是 assets1=IP 的 detail)。
+    if "_dec.get(" not in _xs or '"st_cand"' not in _xs:
+        _a24.append("样本没并判定输入(st_cand/st_cur/wr): 回放只能靠正则解析 decision 文案")
+    # (f)(g) 行为面: 全组 0 分那轮必须 (i) 仍返回 None (ii) 仍留 1 行样本;
+    #       真 rtt_rank 必须真的把 tail/stats 填出来。
+    try:
+        _x24 = load(os.path.join(d, "xbox-speedtest.py"), "xst_a24nw")
+        _x24.rtt_rank = lambda rows, **k: [(10.0, "1.1.1.1", "广东")]
+        # v2.3.31: 生产调用点多了 ms_of/capped_out 两个关键字, 桩必须接住(**k) ——
+        # 不接就是 TypeError, 而它会被 A24 的 except 兜成"样本段失败", 看起来像样本坏了。
+        _x24._screen = lambda rows, h, p, **k: [(50.0, "1.1.1.1")]
+        _x24.median_quick = lambda ip, h, p: 0.0
+        _x24.load_ips = lambda p: [("1.1.1.1", "广东")]
+        _sink24 = []
+        _rn24, _ = capture(_x24.test_pool, "Cn1", "x", "h", "/u", "9.9.9.9", _sink24)
+        if _rn24 is not None:
+            _a24.append("快测全 0 时返回值不再是 None(失败出口被改成了成功形态)")
+        if len(_sink24) != 1 or _sink24[0].get("quick", {}).get("1.1.1.1") != 0.0:
+            _a24.append("全 0 那轮没留下样本: %r" % (_sink24,))
+        _x24t = load(os.path.join(d, "xbox-speedtest.py"), "xst_a24tail")
+        _ms24 = {"1.1.1.1": 11.0, "2.2.2.2": 12.0, "3.3.3.3": 13.0, "4.4.4.4": 14.0}
+        _x24t._rtt_min = lambda ip, port=443: _ms24[ip]
+        _t24 = []
+        _s24 = {}
+        # load() 会把 rtt_rank 换成离线桩, 所以这里必须取 _rtt_rank_real(真实现)。
+        _top24 = _x24t._rtt_rank_real([("1.1.1.1", ""), ("2.2.2.2", ""), ("3.3.3.3", ""),
+                                       ("4.4.4.4", "")], top=2, tail=_t24, stats=_s24)
+        if [r[1] for r in _top24] != ["1.1.1.1", "2.2.2.2"] or _t24 != [[13.0, "3.3.3.3"], [14.0, "4.4.4.4"]]:
+            _a24.append("rtt_rank 没交出被截断的尾部(必须是 [ms, ip]): top=%r tail=%r"
+                        % ([r[1] for r in _top24], _t24))
+        if _s24 != {"pool": 4, "probed": 4, "alive": 4}:
+            _a24.append("rtt_rank 没交代池子大小/实发/通数: %r" % (_s24,))
+    except Exception as _e24:
+        _a24.append("无冠军样本/截断尾部实测失败: %s" % _e24)
+    # (d) 路径必须**调用时**用 BASE 拼。v2.3.28 写成模块级常量, 于是审计里 st_run 改了 x.BASE
+    #     也重定向不动它 —— 一次 audit 38 个用例各 append 一行假样本进真文件(2026-11-07 实测)。
+    #     口径同 RETEST_MARK_NAME: 「路径在调用时用 BASE 拼, 模块导入时算死的话, 测试改 BASE 就
+    #     重定向不动」。这里看 AST 不看正文: 注释里写一句 `SAMPLES = join(BASE,...)` 不该判红
+    #     (v2.3.27 A22 栽过 —— 全文正则把注释当代码)。
+    if 'os.path.join(BASE, "samples.jsonl")' not in _xs:
+        _a24.append('样本路径不是调用时 BASE 拼的 os.path.join(BASE, "samples.jsonl")')
+    try:
+        _tree24 = ast.parse(_xs)
+        # 只认一种形态: 模块体里的赋值语句, 右边出现 "samples.jsonl" 路径
+        _mod24 = [n for n in _tree24.body
+                  if isinstance(n, (ast.Assign, ast.AnnAssign)) and "samples.jsonl" in ast.dump(n)]
+        if _mod24:
+            _a24.append("模块级又出现了 samples 路径常量(改 BASE 重定向不动, 会污染真文件)")
+    except SyntaxError:
+        _a24.append("源码不可解析")
+    chk("A24", "samples.jsonl: 每轮每组 append 一行闭环样本(L0+截断尾部+池子计数/粗筛/快测/计时"
+               "/判定输入), 坏日子也留一行, 且决策一次都不读它",
+        not _a24, "; ".join(_a24))
+
+    # A25: 版本化 URL canary。Cn2 的 TESTPATH 带 build 号, 一撤, **测速与看门狗用的是同一个 URL**,
+    # 同一时刻一起瞎 —— 日志只剩 steady=0.0, 读起来像"网烂了"。canary 买不到"提前 N 天"
+    # (CDN 有没有预警期一次都没观测过), 买的是**点名**。四件, 各有反证:
+    #   走 DNS 不绑 IP(M84 的假警报比不报更有害) / 只发 HEAD / 200 与 206 都算活 / 真的被调用。
+    _ws = open(os.path.join(d, "watchdog.py"), encoding="utf-8").read()
+    _a25 = []
+    if "def canary(" not in _ws:
+        _a25.append("canary 不存在")
+    if 'conn.request("HEAD"' not in _ws:
+        _a25.append("不是 HEAD")
+    _cbody = _ws.split("def canary(", 1)[-1].split("\ndef ", 1)[0]
+    if "BindIPConn(" in _cbody:
+        _a25.append("canary 里绑了 IP: 单台节点坏了会伪装成 URL 下架")
+    # 明文 HTTP, 与下载路径同口径。2026-11-07 18:46 NAS 实测: 一开始写的是 HTTPSConnection,
+    # 真 URL 直接 SSLCertVerificationError(Hostname mismatch, 证书不是给 dlassets.xboxlive.cn 签的)
+    # —— 而下载走的是 HTTP + Host 头, 从来没做过 TLS 校验。等于给体检加了一道被体检对象不遵守的门,
+    # 每小时报一次假警。这条不写下来, 下一个人会觉得"HTTPS 更安全"再改回去。
+    if "HTTPSConnection(" in _cbody or "HTTPConnection(" not in _cbody:
+        _a25.append("canary 用了 HTTPS: 下载路径是明文 HTTP, 真机实测真 URL 会 SSLCertVerificationError")
+    if "st in (200, 206)" not in _cbody:
+        _a25.append("没把 206 算活: 正常返回会被每小时误报成下架")
+    # v2.3.31: 调用形态变了 —— main 现在走 `canary_gate()`, 它才是把档位变成决策的入口。
+    # 这里不能再钉 `for _cn in CANARY: canary(_cn)`(那正是审查方 P1-2 指出的"只点名"写法),
+    # 改成: ①main 必须调用 canary_gate; ②canary_gate 必须真的把 state 交给 canary。
+    # 行为面("gate 三档对不对")由 C73 钉, 这条只管"接上了没有"。
+    # **必须用 ast 不能用文本**: 本文件的版本头注释里就写着 `canary_gate()` 两处 —— 用
+    # `"canary_gate()" in _ws` 判, 变异把 main 那行删掉之后注释仍然满足它, A25 照样绿
+    # (M84 的实测: 删掉调用线, 文本口径 rc=0)。注释不是调用。
+    _wt = None
+    try:
+        _wt = ast.parse(_ws)
+    except SyntaxError:
+        _a25.append("watchdog.py 不可解析, 查不出 canary 有没有进决策")
+
+    def _calls_in(fname, callee, kw=None):
+        """fname 的函数体里有没有对 callee 的调用(可选: 必须带名为 kw 的关键字参数)"""
+        for _fn in (_wt.body if _wt else []):
+            if isinstance(_fn, ast.FunctionDef) and _fn.name == fname:
+                for _n in ast.walk(_fn):
+                    if (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+                            and _n.func.id == callee):
+                        if kw is None or any(_k.arg == kw for _k in _n.keywords):
+                            return True
+        return False
+
+    if not _calls_in("main", "canary_gate"):
+        _a25.append("main 里没有真的调用 canary_gate(注释里提到不算): 档位再准也进不了决策")
+    if not _calls_in("canary_gate", "canary", "state"):
+        _a25.append("canary_gate 没有把 state 交给 canary(闸门不知道每组的档位)")
+    chk("A25", "版本化 URL canary: 每小时 HEAD 一次, 走 DNS 不绑 IP, 200/206 算活, "
+               "且返回值经 canary_gate 进决策",
+        not _a25, "; ".join(_a25))
 
 
 # ------------------------------------------------------------ B 失败出口棘轮
@@ -773,8 +1071,15 @@ def audit_behaviour(d):
                 f.write("%s\t%s\n" % (ip, tag))
         seen = {"rows": None}
 
-        def _sc(rs, host, path):
+        def _sc(rs, host, path, budget=None, ms_of=None, capped_out=None, **k):
+            # v2.3.31: 生产调用点现在传 ms_of/capped_out。桩不接就是 TypeError —— 而它会
+            # 被 C0 兜住并报"段可执行"失败, 看起来像审计器坏了, 实际是桩过期了。
+            # v2.3.32: 同理再加 **k(skip_out/zero_out/wave_out) —— 签名漂一次就要补一次,
+            # 这就是把"桩必须跟得上签名"写进注释的原因。
             seen["rows"] = [ip for ip, _ in rs]
+            seen["ms_of"] = ms_of
+            if capped_out is not None:
+                capped_out.extend(seen.get("capped") or [])
             return screen(rs) if screen else [(100.0 - i, ip) for i, (ip, _) in enumerate(rs)]
         x._screen = _sc
         # 默认: 全池都"握手很快"(只验候选拼装, 不验排序)。给 rtt= 就按它给的 IP 子集入选。
@@ -835,7 +1140,9 @@ def audit_behaviour(d):
     x67 = load(xs_p, "x67")
     x67.SCREEN_WORKERS = 4
 
-    def _slow67(ip, host, path, chunk):
+    def _slow67(ip, host, path, chunk, meta=None):
+        # v2.3.31: _screen 现在把 meta 传下来(撞顶要回报)。桩不接就是 TypeError ->
+        # 线程里被兜成 0.0 -> 全被 sp>0 过滤 -> 这条会以"返回=0"的样子红, 看起来像预算坏了。
         time.sleep(0.12)
         return 25.0
 
@@ -853,7 +1160,7 @@ def audit_behaviour(d):
     x67b.SCREEN_WORKERS = 8
     x67b.SCREEN_MIN_DONE = 8
 
-    def _slow67b(ip, host, path, chunk):
+    def _slow67b(ip, host, path, chunk, meta=None):
         time.sleep(0.05)
         return 20.0
 
@@ -999,7 +1306,7 @@ def audit_behaviour(d):
                     ["assets1.xboxlive.cn", "assets2.xboxlive.cn", "d1.xboxlive.cn", "d2.xboxlive.cn"]),
                    ("Cn2", pth2, "dlassets.xboxlive.cn", "/u2",
                     ["dlassets.xboxlive.cn", "dlassets2.xboxlive.cn"])]
-        x._screen = lambda rs, h, u: ranked
+        x._screen = lambda rs, h, u, **k: ranked      # **k 吃掉 ms_of/capped_out(v2.3.31)
         x.median_quick = lambda ip, h, u: quick_map.get(ip, 0.0)
 
         def _ms(ip, h, u):
@@ -1073,7 +1380,7 @@ def audit_behaviour(d):
         f.write("1.1.1.1\t(广东 电信)\n2.2.2.2\t(广东 移动)\n3.3.3.3\t(广东 联通)\n")
     x5.load_ips = lambda p: [("1.1.1.1", "(广东 电信)"), ("2.2.2.2", "(广东 移动)"),
                              ("3.3.3.3", "(广东 联通)")]
-    x5._screen = lambda rs, h, u: [(90.0, "1.1.1.1"), (80.0, "3.3.3.3")]  # 当前 IP 不在 Top, 粗筛分垫底
+    x5._screen = lambda rs, h, u, **k: [(90.0, "1.1.1.1"), (80.0, "3.3.3.3")]  # 当前 IP 不在 Top, 粗筛分垫底
     x5.median_quick = lambda ip, h, u: 50.0
     x5.QUICK_BUDGET_SEC = 0.0
     rr5, _o5 = capture(lambda: x5.test_pool("Cn1", pth5, "h", "/u", "2.2.2.2"))
@@ -1582,7 +1889,7 @@ def audit_behaviour(d):
     x8.POOLS = [("Cn1", pth8, "assets1.xboxlive.cn", "/u",
                  ["assets1.xboxlive.cn", "assets2.xboxlive.cn", "d1.xboxlive.cn", "d2.xboxlive.cn"])]
     q8 = {"1.1.1.1": 90.0, "2.2.2.2": 85.0, "3.3.3.3": 80.0, "9.9.9.9": 60.0}
-    x8._screen = lambda rs, h, u: sorted(((v, k) for k, v in q8.items()), reverse=True)
+    x8._screen = lambda rs, h, u, **k: sorted(((v, k2) for k2, v in q8.items()), reverse=True)
     x8.median_quick = lambda ip, h, u: q8.get(ip, 0.0)
     x8.router_cmd = lambda cmd: (hist_cn1 if "show" in cmd else "")
     x8.dl_steady = lambda ip, h, p, *a, **k: 0.0
@@ -1811,10 +2118,34 @@ def audit_behaviour(d):
     # dlassets(Cn2) 对 span=256MB / 512MB 一律 12s 超时(两个节点都一样), 8/64/80/160MB 才 206 正常。
     # span 超过 CDN 容忍值 => dl_steady 全返回 0 => 落进"当前IP测不出"分支 => 93.5 的节点被 14.1 换掉。
     # 所以正确约束是「span 落在 CDN 可接受窗内」, 不是「span 越大越好」。
-    chk("C30b", "Range 跨度落在 CDN 容忍窗内(实测 160MiB 通 / 256MiB 超时; 过大会让 dl_steady 全 0)",
-        8 * 1024 * 1024 <= span <= 160 * 1024 * 1024,
-        "span=%dMiB (实测安全窗 8~160MiB, 上限 %dMiB)" % (span // 1048576,
-                                                          x3.STEADY_MAX_BYTES // 1048576))
+    #
+    # v2.3.32 修**理由**(审查方 P2-D): 原来这句理由写的是「实测 160MiB 通 / 256MiB 超时」, 而同一份
+    # 台账 v2.3.14 还记着「512MiB 跨度也返 206(3.6s 收 266MiB)」—— 两条观测并列摆着, 断言只认一边,
+    # 下一个人想调跨度会撞上一条「理由已被自己证伪」的红灯, 而红灯比没红灯更容易让人放弃。
+    # 两条观测并不矛盾, 它们是**两种口径**:
+    #   ① 206 = 服务端接受了 Range。512MiB 那次 3.6s 只收 266MiB, 是读侧提前结束, 不是读完;
+    #   ② 「通」对 dl_steady 的含义是「12s 内读完 span」。256MiB 在 21~24MiB/s 的 Cn2 上
+    #      物理上就要 11~12s, 实测正好卡在 DL_TIMEOUT 上 —— 这才是 160MiB 这个上限的来处。
+    # 所以上限留 160, 但理由换成②; 再把①降级成带日期/出口的注释(它证明的是别的性质: CDN 不按
+    # 跨度大小拒服务)。另加一条能兑现的硬约束: span 不得超过测速文件本身(Cn1 HEAD 实测 309714493B),
+    # 超过它, "读完"就没有定义了。
+    chk("C30b", "Range 跨度落在可读完的窗内(8MiB~160MiB 且 <= 测速文件字节数; "
+         "上限来自「12s 内读得完」, 不是来自「返不返 206」)",
+        8 * 1024 * 1024 <= span <= 160 * 1024 * 1024 and span <= 309714493,
+        "span=%dMiB (上限 %dMiB; 观察: 512MiB 跨度返 206 但 3.6s 只收 266MiB = 没读完)"
+        % (span // 1048576, x3.STEADY_MAX_BYTES // 1048576))
+
+    # ---- C79 两个程序的跨度差异必须被打印, 且那行里的数不能漂 ----
+    # 审查方 P2-C: `[span]` 那行把 160MiB 抄成**字面量**。A23 只比 README ↔ 代码, 不比代码 ↔ 代码,
+    # 所以主程序把 RANGE_SPAN 改成 140 或 180 时, 这行照旧打 160 —— 而它存在的全部意义就是
+    # 「让人知道两把尺子不一样」。抄一份的代价必须由断言兜住, 不然"观测"就是把一个假数念给人听。
+    _wd_code = open(os.path.join(d, "watchdog.py"), encoding="utf-8").read()
+    _m79 = re.search(r"RANGE_SPAN 是 (\d+)MiB", _wd_code)
+    _want79 = x3.RANGE_SPAN // 1048576
+    chk("C79", "watchdog 的 [span] 行: 打出来的 RANGE_SPAN 必须等于主程序真值(字面量会漂)",
+        bool(_m79) and int(_m79.group(1)) == _want79 and "[span]" in _wd_code,
+        "watchdog 写 %r, 主程序 RANGE_SPAN=%dMiB"
+        % (_m79.group(1) + "MiB" if _m79 else "(没找到这行)", _want79))
 
     # ---- C31 服务器忽略 Range(200) 时不得把重传数据当成绩 ----
     x4 = load(xs_p, "xst4")
@@ -1922,6 +2253,424 @@ def audit_behaviour(d):
         "rec=%r out=%r" % (_v65, out65.strip()[-160:]))
 
 
+    # ---- C71 版本化 URL canary 的三个答案 ----
+    # 一个只能报"坏"的函数等于没有: 三个方向必须长得不一样, 否则运维没法据它行动。
+    #   206/200 = 活  -> 不说话(每小时一句"没事"会把真警报埋掉)
+    #   404/403 = 下架 -> 必须点名, 且说到"同一个 URL 两边一起瞎"
+    #   连不上  = ?   -> 只能说"HEAD 失败", **不许**断言 URL 已下架(可能只是本机出网断了)
+    w71 = load(wd_p, "wd71")
+
+    class _Resp71(object):
+        def __init__(self, st):
+            self.status = st
+        def close(self):
+            pass
+
+    class _Conn71(object):
+        status = 206
+        methods = []
+        def __init__(self, host=None, *a, **k):
+            # (host, timeout) 与 (host, ip, timeout) 都要吃得下: 下面的 `BindIPConn` 是同一个桩,
+            # 而 `canary` 一旦改成经 BindIPConn 走(见 M86), 只认两个参数就会 TypeError。
+            self.host = host
+        def request(self, method, path, headers=None):
+            _Conn71.methods.append(method)
+        def getresponse(self):
+            if _Conn71.status < 0:
+                raise OSError("connection refused")
+            return _Resp71(_Conn71.status)
+        def close(self):
+            pass
+
+    class _ClientMod71(object):
+        HTTPConnection = _Conn71
+        HTTPSConnection = _Conn71
+
+    class _HTTPMod71(object):
+        client = _ClientMod71
+
+    w71.http = _HTTPMod71
+    # v2.3.31: `BindIPConn` 也必须桩掉。它是 canary 唯一另一条出门的路 —— 变异 M86 一注入,
+    # canary 就绕开 `http.client.HTTPConnection` 去握真 IP, 于是这条审计在 NAS 上打了 18 次
+    # 真连接、把 subprocess 的 300s 超时跑穿(本地快只是碰巧, 那些 IP 拒得快)。
+    # 审计必须离线跑: 桩要覆盖被测代码**所有**出门的路, 不能只覆盖主路径。
+    w71.BindIPConn = _Conn71
+    _Conn71.status, _Conn71.methods = 206, []
+    ok206, out206 = capture(w71.canary, "Cn2")
+    _Conn71.status = 404
+    ok404, out404 = capture(w71.canary, "Cn2")
+    _Conn71.status = 403
+    ok403, out403 = capture(w71.canary, "Cn2")
+    _Conn71.status = 503
+    ok503, out503 = capture(w71.canary, "Cn2")
+    _Conn71.status = -1
+    okerr, outerr = capture(w71.canary, "Cn2")
+    # 四档文案必须分开。2026-11-07 实测: 改之前 403/429/503 与 404 打的是**逐字相同**的
+    # 一句话, 全叫人「去换 build」。403 多半只是这台出口被限流, 换了 build 明天照样 403 ——
+    # 那不是漏报, 是指错方向, 比不报更费人。
+    chk("C71", "canary 五档: 206/200 静默 / 404 点名撤版 / 403·429 只说被拒(先别换 build) / "
+               "5xx 不下结论 / 连不上只说 HEAD 失败",
+        ok206 is True and out206.strip() == ""
+        and ok404 is False and "404" in out404 and "canary" in out404 and "同一个 URL" in out404
+        and ok403 is False and "别换" in out403 and "撤版" in out403 and "不存在" in out403
+        and ok503 is False and "文件不存在" in out503 and "撤版" not in out503
+        and okerr is False and "HEAD 失败" in outerr and "下架" not in outerr
+        and set(_Conn71.methods) == {"HEAD"},
+        "206=%r/%r 404=%r/%r 403=%r/%r 503=%r/%r err=%r/%r methods=%s"
+        % (ok206, out206.strip()[:40], ok404, out404.strip()[:60],
+           ok403, out403.strip()[:50], ok503, out503.strip()[:50],
+           okerr, outerr.strip()[:60], sorted(set(_Conn71.methods))))
+
+
+    # ---- C72 samples.jsonl 落盘: 两轮 append, 第二轮不能抹掉第一轮 ----
+    # 用真实临时文件跑, 不数文本: M82("a" 改 "w")那种缺陷不报错, 只会让昨天那行安静消失 ——
+    # 而文本断言恰好在有人把 open 换个写法(变量、别名函数)时无能为力。
+    x72 = load(os.path.join(d, "xbox-speedtest.py"), "xst72")
+    _tmp72 = tempfile.mkdtemp(prefix="smp72_")
+    # v2.3.29: 重定向 BASE, 不是重定向一个 SAMPLES 常量 —— 落盘路径必须由被测代码自己现拼。
+    # 若有人把路径改回模块常量, 这条会写进真目录(而且 A26 会当场点名)。
+    x72.BASE = _tmp72
+    _p72 = os.path.join(_tmp72, "samples.jsonl")
+    _r1 = x72.build_sample("Cn1", 6.0, [(11.0, "1.1.1.1", "广东")], [(103.6, "1.1.1.1")],
+                           {"1.1.1.1": 103.6}, {"1.1.1.1": "广东"})
+    _r2 = x72.build_sample("Cn2", 7.0, [(12.0, "5.5.5.5", "")], [(90.0, "5.5.5.5")],
+                           {"5.5.5.5": 90.0}, {})
+    _n1, _o1 = capture(x72.write_samples, [_r1],
+                       [{"group": "Cn1", "ip": "1.1.1.1", "speed": 103.6, "router": "kept (steady 103.6)"}])
+    _n2, _o2 = capture(x72.write_samples, [_r2],
+                       [{"group": "Cn2", "ip": "5.5.5.5", "speed": 90.0, "router": "switched"}])
+    try:
+        _lines = [json.loads(l) for l in open(_p72, encoding="utf-8") if l.strip()]
+    except Exception:
+        _lines = []
+    chk("C72", "samples.jsonl: 两轮 append 共两行(第二轮不覆盖), 决策字段从 summary 合并, 返回写入行数",
+        _n1 == 1 and _n2 == 1 and len(_lines) == 2
+        and _lines[0].get("group") == "Cn1" and _lines[0].get("ip") == "1.1.1.1"
+        and str(_lines[0].get("decision", "")).startswith("kept")
+        and _lines[1].get("group") == "Cn2" and _lines[1].get("speed") == 90.0
+        and len(_lines[0].get("l0") or []) == 1,
+        "n1=%r n2=%r 行数=%d" % (_n1, _n2, len(_lines)))
+    try:
+        os.remove(_p72)
+    except OSError:
+        pass
+    os.rmdir(_tmp72) if os.path.isdir(_tmp72) else None
+
+
+    # ---- C73 canary 的返回值必须真的进决策(不是"被调用过") ----
+    # 审查方 P1-2: main 里原来是 `for _cn in CANARY: canary(_cn)`, bool 被扔掉。于是撤版那天
+    # 照旧 classify(0.0)=dead -> 逐个试热备(每个 256MiB 全 0) -> 定向重测, 每小时约 2GiB
+    # 打在一个已经不存在的 URL 上, 还把钉住的 IP 换掉。A25 只钉"被调用/走 DNS/200·206 算活",
+    # 所以这条要重新钉一遍"值去哪了"。
+    w73 = load(wd_p, "wd73")
+
+    class _Resp73(object):
+        def __init__(self, st):
+            self.status = st
+        def close(self):
+            pass
+
+    class _Conn73(object):
+        status = 206
+        def __init__(self, host=None, *a, **k):
+            pass
+        def request(self, method, path, headers=None):
+            pass
+        def getresponse(self):
+            if _Conn73.status < 0:
+                raise OSError("connection refused")
+            return _Resp73(_Conn73.status)
+        def close(self):
+            pass
+
+    class _Client73(object):
+        HTTPConnection = _Conn73
+        HTTPSConnection = _Conn73
+
+    class _HTTP73(object):
+        client = _Client73
+
+    w73.http = _HTTP73
+    w73.BindIPConn = _Conn73          # 同 C71: 桩要覆盖所有出门的路, 否则 M86 会打真网络
+    _g = {}
+    for _st in (206, 404, 410, 403, 401, 429, 503, 500, -1):
+        _Conn73.status = _st
+        _g[_st] = w73.canary_gate()
+    # main 的接线: gone 分支里必须有 return(否则"闸门"只是个打印)。用 ast 找 main 里
+    # `if gate == "gone"` 的 body, 断言里面有 Return —— 文本里"有 return"不算, 它可能在别的分支。
+    _tree73 = ast.parse(open(wd_p, encoding="utf-8").read())
+    _gone_returns = False
+    for _n in ast.walk(_tree73):
+        if isinstance(_n, ast.FunctionDef) and _n.name == "main":
+            for _b in _n.body:
+                if (isinstance(_b, ast.If) and isinstance(_b.test, ast.Compare)
+                        and getattr(_b.test.comparators[0], "value", None) == "gone"
+                        and any(isinstance(x, ast.Return) for x in _b.body)):
+                    _gone_returns = True
+    chk("C73", "canary 的档位进决策: 404/410 当轮闸门(main 里真 return), 401/403/429 只降级 0 的可信度, "
+               "5xx/连不上照常体检",
+        _g[206][0] == "ok" and _g[404][0] == "gone" and _g[410][0] == "gone"
+        and _g[403][0] == "denied" and _g[401][0] == "denied" and _g[429][0] == "denied"
+        and _g[503][0] == "unknown" and _g[500][0] == "unknown" and _g[-1][0] == "ok"
+        and _g[404][1].get("Cn2") == "gone" and _gone_returns,
+        "206=%r 404=%r 403=%r 503=%r err=%r main_gone_return=%r"
+        % (_g[206], _g[404], _g[403], _g[503], _g[-1], _gone_returns))
+
+
+    # ---- C74 Cn2 的相对劣化档必须真的能触发 ----
+    # 审查方 P1-3: 25 是照 Cn1 的 100MiB/s 量级定的, 而 Cn2 的记录区间是 21~24 ->
+    # `rec >= 25` 在那组恒假。实测 classify(9.0, 23.9) 返回 ok: 从 24 掉到 9(-62%)判"稳定"。
+    w74 = load(wd_p, "wd74")
+    _c74 = {
+        "cn1_25": w74.classify(9.0, 23.9)[0],                        # 默认门槛: 仍按老口径
+        "cn2_10": w74.classify(9.0, 23.9, floor=w74.DEGRADE_MIN_RECORD["Cn2"])[0],
+        "cn2_ok": w74.classify(22.0, 23.9, floor=w74.DEGRADE_MIN_RECORD["Cn2"])[0],
+        "unmeasured": w74.classify(0.0, 23.9, untrusted=True)[0],
+        "dead": w74.classify(0.0, 23.9)[0],
+    }
+    _wdsrc74 = open(wd_p, encoding="utf-8").read()
+    chk("C74", "劣化门槛分组: Cn2(floor=10) 从 24 掉到 9 判 degraded, 掉到 22 仍判 ok; "
+               "canary 被拒时 0 分判 unmeasured 而不是 dead",
+        _c74["cn1_25"] == "ok" and _c74["cn2_10"] == "degraded" and _c74["cn2_ok"] == "ok"
+        and _c74["unmeasured"] == "unmeasured" and _c74["dead"] == "dead"
+        and "DEGRADE_MIN_RECORD.get(name" in _wdsrc74,
+        "classify 实测=%r" % (_c74,))
+
+
+    # ---- C75 读侧校验: 池文件里的内网/畸形地址不许进候选 ----
+    # 审查方 P3-6 实测: load_ips 收下 1.2.3.4.5 / 0.0.0.0 / 192.168.1.9。前两个只是白等超时,
+    # 192.168.x 会被钉进 dnsmasq —— 那一步的后果不是"慢", 是整组断网。
+    x75 = load(os.path.join(d, "xbox-speedtest.py"), "xst75")
+    _t75 = tempfile.mkdtemp(prefix="pool75_")
+    _p75 = os.path.join(_t75, "IP.XboxCn1.txt")
+    with open(_p75, "w", encoding="utf-8") as _fh:
+        _fh.write("1.2.3.4.5 (畸形)\n0.0.0.0 (本网络)\n192.168.1.9 (内网)\n"
+                  "10.1.2.3 (内网)\n169.254.169.254 (元数据)\n8.8.8.8 (好)\n\n")
+    _rows75, _o75 = capture(x75.load_ips, _p75)
+    chk("C75", "load_ips 复用写侧网段表: 畸形/0.0.0.0/内网/链路本地一律拒收并打一行, 公网地址照收",
+        [r[0] for r in _rows75] == ["8.8.8.8"] and "跳过" in _o75,
+        "rows=%r out=%r" % (_rows75, _o75.strip()[:80]))
+    try:
+        os.remove(_p75)
+    except OSError:
+        pass
+    if os.path.isdir(_t75):
+        os.rmdir(_t75)
+
+
+    # ---- C76 粗筛同分按 L0 握手排, 撞顶节点要回报 ----
+    # 审查方 P1-1: 8MiB 在 80MiB/s 以上全撞 SPEED_MIN_EL 地板, 同分后第二键是 **IP 字符串**,
+    # 于是"谁是冠军"由字典序决定。实测 [(80.0,'8.8.8.8'),(80.0,'116.110.9.9'),(80.0,'1.1.1.1')]。
+    x76 = load(os.path.join(d, "xbox-speedtest.py"), "xst76")
+    _cap76 = []
+
+    def _dl76(ip, host, path, chunk, meta=None):
+        if meta is not None:
+            meta.update({"el": 0.02, "capped": True, "bytes": chunk})
+        return 80.0
+    x76.dl_speed = _dl76
+    _ms76 = {"8.8.8.8": 31.0, "116.110.9.9": 12.0, "1.1.1.1": 9.0}
+    _r76, _o76 = capture(x76._screen, [("8.8.8.8", ""), ("116.110.9.9", ""), ("1.1.1.1", "")],
+                         "h", "/p", 90.0, _ms76, _cap76)
+    chk("C76", "粗筛: 同分时按 L0 握手 ms 排(不再按 IP 字典序), 撞 SPEED_MIN_EL 地板的 IP 经 "
+               "capped_out 交回, 且打一行『分数只是下界』",
+        [ip for _sp, ip in _r76] == ["1.1.1.1", "116.110.9.9", "8.8.8.8"]
+        and sorted(_cap76) == ["1.1.1.1", "116.110.9.9", "8.8.8.8"]
+        and "下界" in _o76,
+        "ranked=%r capped=%r out=%r" % (_r76, _cap76, _o76.strip()[:90]))
+
+    # ---- C77 粗筛分数的"并发分摊"必须可观测(wave) ----
+    # 审查方 P1-A: stub 里 12 个**速率完全一样**的节点喂真 `_screen`, 分数是 100/50/33/25×9 ——
+    # 前 3 名是"谁先进场"的产物, 与节点质量零关系。真机侧同一节点: 串行 28.9 / 4 路并发每路 21.3。
+    # 这一列(dl_speed 进场时同批在跑几路)是唯一能把"同节点跨轮漂移"归因到"对手变了"的凭证 ——
+    # 没有它, 改了排序也证明不了改对。**本轮只加观测, 不改排序**(方向见台账)。
+    x77 = load(os.path.join(d, "xbox-speedtest.py"), "xst77")
+    _lock77 = threading.Lock()
+    _st77 = [0]
+
+    def _dl77(ip, host, path, chunk, meta=None):
+        with _lock77:
+            _st77[0] += 1
+            n = _st77[0]
+        time.sleep(0.01)
+        with _lock77:
+            _st77[0] -= 1
+        if meta is not None:
+            meta.update({"el": 1.0, "capped": False, "bytes": chunk})
+        return 100.0 / n          # 共享管道: 进场越晚分得越少(这就是被分掉的那一份)
+    x77.dl_speed = _dl77
+    _w77 = {}
+    _r77, _o77 = capture(x77._screen, [("10.0.0.%d" % i, "") for i in range(12)],
+                         "h", "/p", budget=999.0, wave_out=_w77)
+    _sp77 = [sp for sp, _ip in _r77]
+    # 分数必须差出几倍(同质节点却不同分 = 分摊在场), wave 必须落在 1..SCREEN_WORKERS 且到顶
+    _bowl = bool(_sp77) and max(_sp77) >= 3 * min(_sp77)
+    chk("C77", "粗筛并发分摊可观测: wave_out 每个测到的 IP 都有『进场时同批几路』, 上界=SCREEN_WORKERS; "
+               "12 个同质节点的分数差出倍数(说明分数是份额不是节点能力)",
+        sorted(_w77) == sorted(ip for _sp, ip in _r77)
+        and max(_w77.values()) == x77.SCREEN_WORKERS
+        and _bowl,
+        "wave=%r scores=%r" % (_w77, [round(v, 1) for v in _sp77[:5]]))
+
+    # ---- C78 粗筛三态: 没测到 / 测了 0 分 / 有分 ----
+    # 审查方 P1-B: `ranked` 只收 sp>0, 于是"预算用尽被 cancel"与"测了是 0"在样本里同形(键不存在),
+    # 而 quick 早就有 quick_skip、l0 有 l0_pool/probed/alive —— 同一套论证写两遍漏了粗筛这一遍。
+    x78 = load(os.path.join(d, "xbox-speedtest.py"), "xst78")
+
+    def _dl78(ip, host, path, chunk, meta=None):
+        if ip.endswith(".0.9"):
+            raise OSError("dead")            # 测了但 0 分
+        time.sleep(0.05)
+        if meta is not None:
+            meta.update({"el": 1.0, "capped": False, "bytes": chunk})
+        return 12.0
+    x78.dl_speed = _dl78
+    # 两段分开验: 预算足够时只看得到"测了 0 分"; 预算为 0 时只看得到"没测到"。
+    # 混在一次里谁先谁后由线程调度决定 —— 那会让断言随机红, 而随机红的断言等于没有断言。
+    _sk78a, _ze78a = [], []
+    _r78a, _ = capture(x78._screen, [("10.0.0.1", ""), ("10.0.0.9", ""), ("10.0.0.2", "")],
+                       "h", "/p", budget=999.0, skip_out=_sk78a, zero_out=_ze78a)
+    _sk78b, _ze78b = [], []
+    _r78b, _o78b = capture(x78._screen, [("10.0.0.%d" % i, "") for i in range(12)],
+                           "h", "/p", budget=0.0, skip_out=_sk78b, zero_out=_ze78b)
+    _sk78, _ze78 = _sk78a + _sk78b, _ze78a + _ze78b
+    _smp78 = x78.build_sample("Cn1", 1.0, [], _r78a, {}, {}, screen_skip=_sk78b, screen_zero=_ze78a,
+                              screen_wave={"1.1.1.1": 4})
+    # replay 的 WANTED 从**真实路径**读(变异目录不含 tests/); 但如果变异体自己带了
+    # d/tests/replay.py, 就用它 —— 否则"改 replay 的键"这类变异永远抓不到(等于断言不可反证)。
+    _rp78 = os.path.join(d, "tests", "replay.py")
+    if not os.path.isfile(_rp78):
+        _rp78 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay.py")
+    _rpl = load(_rp78, "rpl78")
+    # 预算 0 + SCREEN_MIN_DONE=6 => 至少有一批被 cancel(没测到); dead 那个是"测了 0 分"
+    chk("C78", "粗筛三态分得开: 没测到(skip_out)/测了 0 分(zero_out)互不重叠, 两者都进样本"
+               "且与 quick_skip 对称(replay.WANTED 三键齐全)",
+        _sk78a == [] and _ze78a == ["10.0.0.9"]          # 预算够 => 只看得见"测了 0 分"
+        and len(_sk78b) >= 1 and _ze78b == []           # 预算 0 => 只看得见"没测到"
+        and _r78a and all(ip not in _sk78 for _sp, ip in _r78a)
+        and _smp78.get("screen_skip") == _sk78b and _smp78.get("screen_zero") == _ze78a
+        and all(k in _smp78 for k in ("screen_skip", "screen_zero", "screen_wave"))
+        and all(k in _rpl.WANTED for k in ("screen_skip", "screen_zero", "screen_wave")),
+        "零分=%r 没测到=%r smp=%r" % (_ze78a, _sk78b, sorted(_smp78)))
+
+    # ---- C80 空 ms_of 的第二键: 退回池文件顺序, 不是 IP 字典序 ----
+    # 审查方 P3-E: `ms_map.get(ip, inf)` 在全空时让每个 IP 都拿 inf, 第二键失效、第三键接管 ——
+    # 实测 ["1.1.1.1","5.5.5.5","9.9.9.9"] 排成原序, 与 ms 齐全时完全相反。而 L0 全不通时
+    # `test_pool` 正好走这条分支(prox 为空), 也就是它**在最该稳的时候**生效。
+    def _dl80(ip, host, path, chunk, meta=None):
+        if meta is not None:
+            meta.update({"el": 1.0, "capped": False, "bytes": chunk})
+        return 10.0                     # 全同分, 只有第二键在起作用
+    x80 = load(os.path.join(d, "xbox-speedtest.py"), "xst80")
+    x80.dl_speed = _dl80
+    _rows80 = [("9.9.9.9", ""), ("5.5.5.5", ""), ("1.1.1.1", "")]
+    _r80a, _ = capture(x80._screen, _rows80, "h", "/p", budget=999.0, ms_of={})
+    _r80b, _ = capture(x80._screen, _rows80, "h", "/p", budget=999.0,
+                       ms_of={"9.9.9.9": 8.0, "5.5.5.5": 40.0, "1.1.1.1": 120.0})
+    chk("C80", "粗筛第二键: ms_of 空时退回池文件顺序(不是 IP 字典序), ms 齐全时按握手 ms 升序",
+        [ip for _sp, ip in _r80a] == ["9.9.9.9", "5.5.5.5", "1.1.1.1"]
+        and [ip for _sp, ip in _r80b] == ["9.9.9.9", "5.5.5.5", "1.1.1.1"],
+        "空 ms=%r 有 ms=%r" % ([ip for _sp, ip in _r80a], [ip for _sp, ip in _r80b]))
+
+    # ---- C81 replay 的默认值必须真的回答它自己的那个问题 ----
+    # 审查方 P3-F: docstring 写"默认用 1.15 对比现行门槛", 而代码是 `new_ratio = None` ——
+    # 不带参数跑一遍, 翻转恒为 0(拿旧门槛比自己), 它只打一张字段完整率。
+    # **提示是对的, 默认是错的**: 一个"回放器"不带参数就不回放, 等于它证明不了任何事。
+    # 这里用一行**会翻转**的夹具: Cn2 wr=1.30 现行保持, 1.15 会换 —— 无参数必须打出"翻转 1 轮"。
+    _tmp81 = tempfile.mkdtemp()
+    _p81 = os.path.join(_tmp81, "samples.jsonl")
+    with open(_p81, "w", encoding="utf-8") as _fh:
+        _fh.write(json.dumps({"ts": "2026-11-08T00:00:00", "group": "Cn2", "cur": "1.1.1.1",
+                              "wr": 1.30, "st_cur": 22.0, "st_cand": 26.0, "q_cur": 25.0,
+                              "ip": "2.2.2.2", "speed": 26.0, "decision": "kept"},
+                             ensure_ascii=False) + "\n")
+    _old81 = _rpl.BASE
+    _rpl.BASE = _tmp81
+    _err81 = ""
+    try:
+        try:
+            _r81, _o81 = capture(_rpl.main, [])
+        except Exception as _e81:
+            # 默认值退化时(比如被改回 None)最常见的结果是**在算 abs(cur - None) 时崩**。
+            # 不在这里兜住的话, 异常会一路走到 C0「段可执行」—— 那条红只说"崩了", 不说
+            # "回放器没在回放"。断言必须**命名**缺陷, 否则下一个人得靠猜。
+            _o81, _err81 = "", "%s: %s" % (type(_e81).__name__, _e81)
+    finally:
+        _rpl.BASE = _old81
+        shutil.rmtree(_tmp81, ignore_errors=True)
+    chk("C81", "replay 无参数时按 DEFAULT_RATIO(%g) 真的回放: 夹具里 22->26 在 1.30 下保持、"
+               "1.15 下换, 必须打出『翻转 1 轮』(不是『(未指定)』)"
+        % getattr(_rpl, "DEFAULT_RATIO", -1),
+        getattr(_rpl, "DEFAULT_RATIO", None) is not None
+        and abs(_rpl.DEFAULT_RATIO - 1.15) < 1e-9
+        and "翻转 1 轮" in _o81 and "未指定" not in _o81,
+        "DEFAULT_RATIO=%r %s out=%r" % (getattr(_rpl, "DEFAULT_RATIO", None), _err81,
+                                        _o81.strip().splitlines()[-3:]))
+
+    # ---- C82 撞顶线是**每路**的: screen_cap = SPEED_CEIL_MIB / max(screen_wave) ----
+    # v2.3.33。审查方在上轮报「8MiB 撞顶在本出口 0/6, 不发生」, 这一轮它把并发降到 1 再测:
+    # 67 / 80.0 / 80.0 / 69 —— 一半撞顶。两个观测都对, 差在档位: `SCREEN_WORKERS=4` 把每路压到
+    # ~21MiB/s, 结构上永远碰不到 80 的天花板, **并发分摊把撞顶掩盖了**。
+    # 本地取证(NAS samples.jsonl 3 条 / 143 个粗筛分数): P50 21.6 / P90 35.7 / max 62.7 / 到 80 的 0 个。
+    # 于是 `screen_capped` 在现行档位下恒空 —— 而"空"有两种含义(这一档撞不到 / 真没人撞), 同形。
+    # 这是 P1-B「缺席原因必须可辨」的第四遍, 前三遍钉在 quick_skip / l0_pool / screen_skip+zero 上。
+    _smp82 = x78.build_sample("Cn1", 1.0, [], [(-10.0, "1.1.1.1")], {}, {},
+                              screen_wave={"1.1.1.1": 4, "2.2.2.2": 1}, screen_cap=80.0 / 4)
+    _smp82b = x78.build_sample("Cn1", 1.0, [], [], {}, {}, screen_wave={}, screen_cap=None)
+    _ceil82 = getattr(x78, "SPEED_CEIL_MIB", -1)
+    chk("C82", "撞顶线是每路的: SPEED_CEIL_MIB=8MiB/0.1s=80, 样本 screen_cap 必须随 max(wave) 摊薄"
+               "(4 路=>20.0); 没量出 wave 时记 None, 让『没记』与『记了 0』可辨",
+        abs(_ceil82 - 80.0) < 1e-9
+        and _smp82.get("screen_cap") == 20.0
+        and _smp82.get("screen_wave") == {"1.1.1.1": 4, "2.2.2.2": 1}
+        and "screen_cap" in _smp82b and _smp82b.get("screen_cap") is None,
+        "SPEED_CEIL_MIB=%r cap=%r cap_no_wave=%r" % (_ceil82, _smp82.get("screen_cap"),
+                                                     _smp82b.get("screen_cap")))
+
+    # ---- C83 常量定义与 capped 判据都必须是**每路**口径 ----
+    # 反面: 谁"顺手"把 SPEED_CEIL_MIB 除以 SCREEN_WORKERS 当成"节点上限", 那么在 4 路下
+    # 线变成 20MiB/s —— 而实测 P50 就是 21.6, 于是**一半以上节点被判撞顶**, capped 从"永远空"
+    # 翻成"永远满", 两种都是把观测变成噪声。同理 capped 判据若写成 `el < SPEED_MIN_EL * SCREEN_WORKERS`,
+    # 8MiB 在 0.4s 内读完也算撞顶。
+    _src83 = open(os.path.join(d, "xbox-speedtest.py"), encoding="utf-8").read()
+    _m83 = re.search(r"^SPEED_CEIL_MIB\s*=\s*([^\n#]+)", _src83, re.M)
+    _expr83 = (_m83.group(1).strip() if _m83 else "")
+    chk("C83", "SPEED_CEIL_MIB 是每路天花板(定义里不得出现 SCREEN_WORKERS), capped 判据是 "
+               "`el < SPEED_MIN_EL`(el 是这一路读完 8MiB 的秒数), 不是 ×并发数",
+        bool(_m83) and "SCREEN_WORKERS" not in _expr83
+        and "SCREEN_CHUNK" in _expr83 and "SPEED_MIN_EL" in _expr83
+        and abs(_ceil82 - 80.0) < 1e-9
+        and re.search(r'"capped":\s*el\s*<\s*SPEED_MIN_EL\b', _src83) is not None,
+        "定义=%r 值=%r" % (_expr83, _ceil82))
+
+    # ---- C84 端到端: test_pool 真的把「本轮单路撞顶线」算进样本 ----
+    # C82 只证明 build_sample 收得下这个数; 生产路径上这个数由 test_pool 算 —— 若那里写死
+    # `_cap_line = SPEED_CEIL_MIB`(不看 wave), 样本会记 80.0, 于是"4 路撞不到"这层解释又没了,
+    # 而 C82 仍绿。两条必须都有, 否则断言只钉住了"能传", 没钉住"传的是对的"。
+    x84 = load(os.path.join(d, "xbox-speedtest.py"), "xst84")
+    _p84 = os.path.join(tempfile.mkdtemp(), "p84.txt")
+    with open(_p84, "w", encoding="utf-8") as f:
+        f.write("1.1.1.1\t(广东 电信)\n2.2.2.2\t(广东 移动)\n")
+    x84.load_ips = lambda p: [("1.1.1.1", "(广东 电信)"), ("2.2.2.2", "(广东 移动)")]
+
+    def _sc84(rs, h, u, budget=None, ms_of=None, capped_out=None, skip_out=None,
+              zero_out=None, wave_out=None):
+        if wave_out is not None:
+            wave_out.update({"1.1.1.1": 4, "2.2.2.2": 3})
+        return [(30.0, "1.1.1.1"), (20.0, "2.2.2.2")]
+    x84._screen = _sc84
+    x84.median_quick = lambda ip, h, u: 40.0
+    _sink84 = []
+    _r84, _o84 = capture(x84.test_pool, "Cn1", _p84, "h", "/u", None, _sink84)
+    _smp84 = _sink84[-1] if _sink84 else {}
+    chk("C84", "test_pool 把单路撞顶线算进样本: 最大并存 4 路 => screen_cap=20.0, "
+               "且 capped 为空时打一行明说(否则 capped 空依旧无从解释)",
+        _smp84.get("screen_cap") == 20.0
+        and any("单路撞顶线只有 20.0MiB/s" in ln for ln in _o84.splitlines()),
+        "screen_cap=%r 相关行=%r" % (_smp84.get("screen_cap"),
+                                    [ln.strip() for ln in _o84.splitlines() if "撞顶" in ln][:2]))
+
+
 def _stub_wd(wd_p):
     """给 watchdog.main 搭桩: 按 IP 队列返回吞吐序列, 记录是否触发重测"""
     class S:
@@ -1960,6 +2709,33 @@ def _stub_wd(wd_p):
                     self.ran.append((a, k))
                     return type("R", (), {"returncode": P.rc})()
             m.subprocess = P()
+
+            # v2.3.31: `main` 现在每小时真的问一次 `canary_gate()`。不桩 http 的话, **每一条**
+            # 走 main 的用例都会对真 URL 发 HEAD: 有网时是几十毫秒, 没网/被墙时每条卡满
+            # `DL_TIMEOUT=12s` —— 这里八条用例就是 96s, 而 NAS 侧 M86(把 canary 改成绑 IP)
+            # 的实测结果是 `subprocess.TimeoutExpired: ... timed out after 300 seconds`。
+            # 审计必须能离线跑, 这条桩和 A22 是一个道理: 不能靠"本机恰好能连上"。
+            class _Resp(object):
+                status = 206            # 200/206 = 活: 让 canary 静默, 决策链不受它影响
+                def close(self):
+                    pass
+
+            class _Conn(object):
+                def __init__(self, host=None, *a, **k):
+                    pass
+                def request(self, method, path, headers=None):
+                    pass
+                def getresponse(self):
+                    return _Resp()
+                def close(self):
+                    pass
+
+            class _Client(object):
+                HTTPConnection = _Conn
+                HTTPSConnection = _Conn
+            m.http = type("_HTTP", (object,), {"client": _Client})
+            m.BindIPConn = _Conn       # canary 另一条出门的路, 有一条没桩住就等于没桩
+
             _r, self.out = capture(m.main)
             return self.out
     return S()
@@ -2005,6 +2781,28 @@ def audit_hygiene(d):
         raw = open(p, "rb").read()
         blob += raw.decode("utf-8", "replace")
         chk("D-crlf:" + f, "%s 为 LF 换行(部署到 Linux 不炸)" % f, b"\r\n" not in raw)
+    # deliver.sh 也是交付物(2026-11-07 新增, 只在 F 侧存在 —— NAS 没有对端, 所以这里必须 isfile 守)。
+    # 之前这四件全审、独漏它: 一个 CRLF 的 deliver.sh 在 git-bash 里第一行就 command not found,
+    # 而 137 项照样全绿 —— 交付脚本自己不在交付面的审计里, 是"交付态自己不看自己"的最后一层。
+    _dlv = os.path.join(d, "deliver.sh")
+    if os.path.isfile(_dlv):
+        _draw = open(_dlv, "rb").read()
+        chk("D-crlf:deliver.sh", "deliver.sh 为 LF 换行(CRLF 会让 git-bash 报 command not found)",
+            b"\r\n" not in _draw)
+        _dtxt = _draw.decode("utf-8", "replace")
+        # 锚点必须是 `PAIRS=(` .. 行首 `)`。曾写成 `PAIRS=$(.*?)\n$`: 那个 `$` 在正则里是**行尾锚点**,
+        # 等于要求「PAIRS= 之后直接结束」, 永远匹配不上 -> _pl 恒为 [] -> 这条检查永久红(实测)。
+        _blk = re.search(r"PAIRS=\((.*?)\n\)", _dtxt, re.S)
+        _pl = re.findall(r'^\s*"([^":]+):', _blk.group(1), re.M) if _blk else []
+        # 漏一行 => 那个文件在 NAS 上永远是旧版, 而 check 打 ok; 多一行 => 路径打错, 永远报 DIFF。
+        # v2.3.31: `tests/replay.py` 就是漏在这一行里的 —— README 清单列了它、PAIRS 没有,
+        # 于是 push 永远不带它、而它自己在 NAS 上永远缺; D8 却因为 `_want` 也只数两个 tests 而全绿。
+        # 交付集合从这个常量走, 别再手抄一份。
+        _want = set(files) | {"tests/audit.py", "tests/selftest_audit.py", "tests/replay.py",
+                              "../AI共管台账.md"}
+        chk("D8", "deliver.sh 的 PAIRS 与交付集合一一对应(漏一行=那个文件在 NAS 上永远是旧版而 check 说 ok)",
+            bool(_blk) and set(_pl) == _want, "PAIRS=%s 多=%s 少=%s"
+            % (sorted(_pl), sorted(set(_pl) - _want), sorted(_want - set(_pl))))
     bad = []
     for pat, label in DENY_PATTERNS:
         hits = []
@@ -2087,6 +2885,7 @@ def main():
     # 反而吐一个 traceback、连 RESULT 行都没有, 变异自检会把"漏网"当成"通过"。
     # 这正是上面注释里声明"不能发生"的那件事(2026-11-07 外部审计 P0-2)。
     actual = {}
+    _prod_before = run_products_state(d)      # A26 交付态守卫: 跑前拍一次
     for seg, fn, cid in (("A 静态契约", audit_static, "A0"),
                          ("B 失败出口棘轮", audit_failure_registry, "B0"),
                          ("C 行为契约", audit_behaviour, "C0"),
@@ -2101,6 +2900,13 @@ def main():
             continue
         if fn is audit_failure_registry:
             actual = r or {}      # 只有 B 段有返回值(出口统计), 别被后面几段的 None 覆盖掉
+    # A26: 跑完对账。断言的是"文件的字节没变", 不是"用例记得改 BASE" —— 后者靠自觉, 而且
+    # 2026-11-07 已经靠不住一次(38 行假样本混进真 samples.jsonl, 人眼在 39 行里挑不出来)。
+    _prod_after = run_products_state(d)
+    _dirty = [n for n in RUN_PRODUCTS if _prod_before.get(n) != _prod_after.get(n)]
+    chk("A26", "审计不写交付态: 跑完 audit 后 samples/results/speed.log/.last_retest/run.log 一字节不动",
+        not _dirty, "被改动=%s (before=%s after=%s)"
+        % (_dirty, [_prod_before.get(n) for n in _dirty], [_prod_after.get(n) for n in _dirty]))
     fail = [r for r in RESULTS if not r[2]]
     print("\n失败出口统计: %d 个函数 / %d 条出口" % (len(actual), sum(actual.values())))
     print("RESULT: %d 项, 全过" % len(RESULTS) if not fail

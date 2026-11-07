@@ -2,6 +2,119 @@
 # -*- coding: utf-8 -*-
 r"""
 Xbox 加速 - NAS 定时自动测速找最快节点并更新路由器 (ZOS/Python3.8 兼容)
+v2.3.33 (2026-11-08 第二十九轮 —— 审查方把上一轮自己的结论翻案了; **阈值/并发/排序一个未动**):
+  - (翻案) 上一轮它报「8MiB 撞顶在本出口 0/6, 不发生」。本轮它把并发降到 1 再测: 67 / 80.0 / 80.0 / 69
+    —— 一半撞顶。两个观测都对, 差在档位: `SCREEN_WORKERS=4` 把每路压到 ~21MiB/s, 永远碰不到 80 的
+    天花板, **并发分摊把撞顶掩盖了**。本地取证(NAS samples.jsonl 3 条样本 / 143 个粗筛分数):
+    P50 21.6 / P90 35.7 / **max 62.7** / 等于 80.0 的 **0 个** —— 与"4 路摊薄"完全吻合。
+  - (由此推出) `screen_capped` 在现行档位下**结构性恒空**, 而"空"有两种含义:「这一档撞不到」(必然,
+    4 路要撞 80 得先有 320MiB/s 总带宽) 与「真没人撞」(可能) —— **同形**。这是 P1-B「缺席原因必须
+    可辨」的第四遍, 前三遍钉在 `quick_skip` / `l0_pool` / `screen_skip+screen_zero` 上, 这次钉在 capped。
+    修: 抽 `SPEED_CEIL_MIB`(=80, **每路**的), `test_pool` 按 `max(screen_wave)` 算本轮单路撞顶线,
+    样本记 `screen_cap`, capped 为空且并发>1 时打一行明说。**分数一个不变, 并发一个不变。**
+  - (自曝收到) 审查方在本轮承认「每轮实际看到 8 条, 只讲 3 条, 剩下的留到下一轮」是它自己造成的
+    "总有新发现"的一部分。所以本轮的修法只覆盖它写出来的这一条翻案, 它没写的未公开条目我不猜。
+  - 反面教训已写进 `SPEED_CEIL_MIB` 注释: 谁"顺手"把该常量除以 `SCREEN_WORKERS` 当成节点上限,
+    `capped` 就永不触发 —— 由 C83 钉住。
+v2.3.32 (2026-11-08 第二十八轮 —— 外部审查六条, 实测全属实; **阈值/排序口径一个未动**):
+  - (P1-A) 8MiB 粗筛的分数不是「这个节点多快」, 是「它进场时抢到了几路带宽」。`SCREEN_WORKERS=4`
+    意味着每一路都被平分过一次: 真机同一节点串行 28.9 / 4 路并发每路 21.3; stub 里 12 个
+    **速率完全一样**的节点喂进来, 分数是 `2000/1000/667/500`(= 100/n 的同一件事), 前 3 名就是
+    先进场的那 3 个。**这一轮只加观测**: `_screen(wave_out=)` 回传「进场时同批几路」, 样本记
+    `screen_wave` —— 没有这一列, 「同节点跨轮分数漂移」根本无法归因到「对手变了」还是「节点变了」。
+    改排序/改并发是下一轮的事, 且必须先有这一列才证明得了改对。
+  - (P1-B) 粗筛缺三态, 而 `quick`/`l0` 都有: `ranked` 只收 `sp > 0`, 于是「预算用尽被 cancel 没测」
+    与「测了是 0」在样本里**同形**(键不存在), 而两者对下一轮的含义正相反(该补测 / 该拉黑)。
+    `quick_skip`、`l0_pool/probed/alive` 早就是这个论证, 写了两遍漏了粗筛。修: `skip_out`/`zero_out`,
+    样本记 `screen_skip`/`screen_zero`, `replay.WANTED` 补齐对称的三键。
+  - (P3-E) L0 全不通的回退分支里, `ms_of` 是空表 → `ms_map.get(ip, inf)` 让每个 IP 都拿 inf,
+    第二键失效、第三键(IP 字符串)接管: 实测 `["1.1.1.1","5.5.5.5","9.9.9.9"]` 排成原序,
+    与 ms 齐全时**完全相反**。而这条分支正好在「一轮握手全失败」时生效 —— 最该稳的时候。
+    修: 空表时第二键退回池文件顺序(`pos`), 不再用 inf。
+  - 阈值、`SCREEN_WORKERS`、`SPEED_MIN_EL`、`RANGE_SPAN` 全部原样。
+v2.3.31 (2026-11-07 第二十七轮 —— 外部审查八条, 逐条实测全属实; **阈值一个未动**):
+  - (P1-1) 8MiB 粗筛有 80MiB/s 硬天花板, 同分后按 IP 字典序排名。实测: 本地 stub 8MiB 三次都是
+    80.000(=8MiB/0.1s), 而真机 Cn1 工作速率 95~103MiB/s; 同分排序 `[(80.0,'8.8.8.8')]` 压过
+    `1.1.1.1`。修法**不改测量口径**(分母仍是 0.1s, 数字一个不变): ①抽成 `SPEED_MIN_EL` 常量,
+    读代码能看见天花板; ②撞顶节点由 `dl_speed(meta=)` 交回 `capped`, 样本记 `screen_capped`,
+    `screen` 那列从「精确值」变成「至少」时不再是隐形的; ③粗筛同分改按 L0 握手 ms 排第二键,
+    名次不再由 IP 字符串决定; ④撞顶 >=3 个时打一行, 让人知道此刻粗筛没有分辨率。
+  - (P1-2) `canary` 只点名, 返回值没人接: `for _cn in CANARY: canary(_cn)` 扔掉 bool。撤版那天
+    照旧 `classify(0.0)` 判 dead → 逐个试热备(每个 256MiB 全 0)→ 触发定向重测, 每小时约 2GiB
+    打在一个 404 上。修: `canary_gate()` 汇总三档 —— 404/410 = 当轮闸门(不判死/不止血/不重测);
+    401/403/429 = 本轮 0 **不可信**(`classify(..., untrusted=True)` 出 `unmeasured`, 不判死)。
+  - (P1-3) Cn2 的相对劣化档实际失效: `DEGRADE_MIN_RECORD=25` 是照 Cn1 的 100MiB/s 量级定的,
+    而 Cn2 自己那份包的记录区间是 21~24(v2.3.8 ⑦ 自己写的)。实测 `classify(9.0, 23.9)='ok'`
+    —— 从 24 掉到 9(-62%)判正常。修: 门槛分组 `{'Cn1': 25.0, 'Cn2': 10.0}`, `classify` 加
+    `floor=` 参数(默认 25.0, 旧调用点行为不变)。
+  - (P2-4) `l0_tail` 记了但用不了: 只有一串裸 ms, 第 49 名**是谁**依然不可知。修: tail 记
+    `[ms, ip]`, 并在截断边界打一行「尾部 8 个里有几个落在入选最慢 ×1.05 内」。**不做自动补测**:
+    那会改候选集, 而这一轮的口径是「先把证据留下」。
+  - (P2-5) `samples.jsonl` 没有消费者, 字段还没定稿。修: 新增 `tests/replay.py`(离线, 不参与
+    决策), 只回答一个具体问题 —— `WIN_RATIO` 1.30 改 1.15 会多换几次、每次换来多少 MiB/s;
+    同时报每行缺哪个字段。样本补 `screen_capped` 与 `quick_skip`(预算跳过的候选, 原来只能靠
+    「缺键」推断, 与「测了是 0」分不开)。
+  - (P3-6) 读侧零校验: `load_ips` 的 `^([0-9.]+)` 收下 `1.2.3.4.5` / `0.0.0.0` / 一个 `192.168.x.x`
+    (实测)。最后那个是真风险 —— 局域网 HTTP 服务可能测出高分并被钉进 dnsmasq。修: 直接 import
+    `pool_refresh.ip_reject_reason` 那张网段表(写侧唯一真相), 坏行打一行 reject 并跳过。
+  - (P3-7) watchdog 用 256MiB 跨度、主程序用 160MiB, 而「256MB 必炸」是某个出口的观测、被写成了
+    常量规律。**跨度不动**(改口径在本项目已两次引发生产事故), 改注释降级 + 每小时打一行跨度,
+    让「两个程序测的不是同一件事」看得见。
+  - (P3-8) `deliver.sh` 的 IGN 不含 `*.tmp`: `os.replace` 中途崩掉留的 `results.json.tmp` 会被
+    `comm` 报成单侧项、rc=1, 指向「交付不一致」—— 实际只是崩溃残留, 而失败方向正好是这个脚本
+    存在的理由。修: IGN 加 `\.tmp$`。
+v2.3.30 (2026-11-07 第二十六轮 —— 补观测链的三处空洞; **决策逻辑零改动**):
+  外部审查方给副本 (xs-r5) 提了五条, 逐条实测全部属实。这一轮全部落地:
+  - (1) `l0` 证明不了「RTT_TOP=48 漏没漏」: 它只含**入选的** 48 个, 第 49 名在 `out[:top]`
+    截断时就没了 —— 实测 60 节点 / top=48 返回 48 条, 49 号的 49.0ms 不在返回值里。
+    修: `rtt_rank(..., tail=)` 交出被截掉的后 8 个 ms, 样本记 `l0_tail`。
+    再加 `l0_pool / l0_probed / l0_alive`: 预算收手时 l0 短于 48 且 tail 为空, 那和
+    「池子刚好 48 个」在样本里长得一模一样, 含义却相反(证据齐全 vs 根本没测完)。
+  - (2) 样本缺**判定输入**: `build_sample` 只出测量面, `cur/wr/st_cur/st_cand/q_cur` 一个都没有。
+    回放要回答「1.30 改 1.15 会多换几次」, 只能靠正则去抠 router 的散文 —— 而切换分支的文案
+    里一个数都没有(只有 `assets1=IP` 的 detail)。修: main 在两条分支各记一份 `dec[name]`,
+    `write_samples` 落盘时并进去。
+  - (3) 坏日子不留样本: 快测全 0 时 `test_pool` 直接 `return None`, 那一轮 samples 一行都没有 ——
+    三个月后回放会得出「这网一直很稳」, 而它只是把坏日子丢了。修: 样本经 `sample_sink` 参数
+    提前交出(**不**塞进返回值 —— `return None` 是这条链唯一的失败出口, B1 棘轮钉着)。
+  - (4) canary 一档文案: 403/429/503 与 404 逐字相同, 全叫人「去换 build」。实测四档同一句话。
+    修: 404/410 = 撤版(换 build); 401/403/429 = 被拒(别换, 连续 3 次再说); 其余 = 不下结论。
+  - (5) A24 的注释比断言多: 夹具传的是**降序**, 断言要求「保持」, 它证明的是「不重排」,
+    排序本身由 C68 钉。注释改成实话。
+  - 断言总数不动 (145), 但 A24 / C71 内部从 6 个子项扩到 10 个 (扩的是现有条目, 不是新条目:
+    这五条打的是同一份"观测链", 拆成新编号只会让人以为多了个新功能);
+    变异 89 -> 93 (M90 sink 写反 / M91 canary 全归撤版 / M92 tail 不填 / M93 stats 不填).
+v2.3.29 (2026-11-07 第二十五轮 —— 修 v2.3.28 的落盘污染; **决策逻辑零改动**):
+  - 缺陷: `samples.jsonl` 的路径写成了模块级常量 `SAMPLES = join(BASE, ...)`, 而审计里 38 个用例
+    通过 `st_run` 走 `main` 时会先把 `x.BASE` 指到临时目录。常量在 import 时就算死了, 于是这 38 个
+    假样本(全是 `9.9.9.9` / `1.0ms` 夹具)全进了**真** samples.jsonl, 真机那一轮只剩 1 行.
+    这是「审计不得污染交付态」的直接破口, 而且和 `results.json`/`speed.log`/`.last_retest` 的
+    既有约定相反 —— 那三个都在调用时用 BASE 拼, 所以一直是干净的.
+  - 修法: 去掉模块常量, `write_samples` 里现拼 `os.path.join(BASE, "samples.jsonl")`.
+  - A24 口径随之换: 不再数 `SAMPLES` 名字, 改钉「append 形态的路径必须是调用时 BASE 拼」
+    + 「模块体里不许出现 samples 路径常量」(ast 看模块级 Assign, 不看正文文本 —— 注释里提一句
+    不该判红, 这是 v2.3.27 A22 的坑). 新增 **A26 交付态守卫**: 跑 audit 前后对
+    `samples.jsonl / results.json / speed.log / .last_retest / run.log` 做 size+mtime+md5 快照,
+    有任何一处被本次审计改动即红 —— 今后任何新落盘路径漏了重定向, 不必等人眼.
+  - 变异自检 87 -> 88 (M88: 把模块级 `SAMPLES` 常量加回去 -> A24 红).
+v2.3.28 (2026-11-07 第二十四轮 —— 闭环样本 + 版本化 URL canary; **决策逻辑零改动**):
+  - `samples.jsonl`: 每轮每组 append 一行 `{ts,group,l0,screen,quick,t_l0,ip,speed,decision}`。
+    `results.json` 只留**结论**(冠军 + 热备), 一轮几百个测量值原本全丢在 stdout 里 ——
+    WIN_RATIO / REPLACE_MIN / DEGRADE_RATIO 因此只有 n=1 的依据, watchdog 判 degraded 也只能
+    拿一个数跟单次实测比, 而同一节点单次实测能差 4 倍(Cn2)。有分布之后「1.30 改 1.15 在过去
+    样本上会多换几次、每次换来多少 MiB/s」才可回答 —— 这是唯一能让阈值改动**被证否**的东西。
+    **只 append, 不参与决策**: 决策路径一次都不读这个文件(A24 钉住: append 用调用时 BASE 拼的路径,
+    模块里不许有 samples 路径常量; 样本也从 r 里 pop 掉, 不混进 watchdog 读的 results.json)。
+  - 伴生改动在 watchdog.py: Cn2 版本化 URL 的 `canary()`(每小时一个 HEAD, 非 200/206 点名)。
+v2.3.27 (2026-11-07 第二十三轮 —— 无决策行为改动, 只拆计时口径 + 同步整改外部审计四条):
+  - 计时口径: 把 L0 从「粗筛」的账里拆出来。此前 `t_screen` 从 `t_start` 起算, 日志里的「粗筛 12s」
+    有近一半是 L0 握手(真机 Cn1 12s 里约 5.6s 是 261×3 次握手), 读的人会以为该调 SCREEN_WORKERS,
+    实际那半由 RTT_WORKERS/RTT_TRIES 决定。现在三段各记各的: `[t] L0 6s / 粗筛 6s / 快测 33s`。
+    决策不读这三个数, 测速冠军与所有阈值都不动。
+  - 其余整改在 tests/ 与 deliver.sh: A22 从全文正则换成 AST**注解**口径(注释里写 `int 竖线 None`
+    不再假红 —— 假红会挡掉反证, 那半边此前一个变异都没有)、新增 A23 把 README 的「常量=数值」
+    与代码真值绑住(实测 RTT_TOP 48->72 曾是 137 项全绿)、deliver.sh 收进交付面(D-crlf + D8 PAIRS 对账)、
+    deliver.sh 补 `*)` 分支(拼错子命令曾静默当 check 跑并返回 0)与 SSH-FAIL 三态(255 vs 1)。
 v2.3.26 (2026-11-07 第十九轮 —— 候选来源从"省份标签"换成"实测 RTT 排序"; 有运行行为改动):
   池里的省份标签是**人写的**, 会漏; RTT 是本机实测的, 不会漏。
   - 真机打靶(261 / 254 个节点全测): 标签本地 31 个中位 11.3ms, 标签非本地 226 个中位 35.5ms ——
@@ -299,9 +412,17 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import http.client
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 读侧校验复用**写侧**那张网段表(pool_refresh._REJECT_NETS / ip_reject_reason), 不另抄一份 ——
+# 两份表就是两个真相, 而这张表的口径本身带着版本坑(py3.8 里 100.64/10 的 is_private 是 False),
+# 抄一份等于把坑抄两遍。sys.path 里插自己的目录: 审计用 spec_from_file_location 加载本模块时,
+# 脚本目录不在 sys.path 上(它是 `python3 xbox-speedtest.py` 才有的待遇), 不插就 ImportError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pool_refresh import ip_reject_reason   # noqa: E402  (必须在 sys.path 之后)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 POOLS = [
@@ -315,8 +436,37 @@ POOLS = [
 # 注: mp 下载域名(dl.delivery.mp.microsoft.com 等)不再钉 IP——2026-10-27 WorkBuddy 证实
 # 钉 IP 对 HTTPS 消费端(Edge)会因证书不匹配/节点过期导致下载失败,该组改原生 DNS 解析。
 
+# 闭环样本落盘(每轮每组一行 JSONL)。results.json 只留**结论**(冠军 + 热备), 一轮几百个测量值
+# 原本全丢在 stdout 里: WIN_RATIO / REPLACE_MIN / DEGRADE_RATIO 只能 n=1 拍, watchdog 判 degraded
+# 也只能拿一个数跟单次实测比, 而同一节点单次实测就能差 4 倍(Cn2)。有分布之后"阈值从 1.30 改到
+# 1.15 在过去样本上会多换几次、每次换来多少 MiB/s"才可回答。
+# **只 append, 不 replay, 不参与决策** —— 决策路径一次都不读这个文件(A24 钉住这条)。
+# 路径在 write_samples 里用 BASE 现拼, 不做模块级常量: v2.3.28 把它写成 `SAMPLES = join(BASE, ...)`,
+# 于是审计里 st_run 改了 BASE 也重定向不到它 —— 一次 audit 有 38 个用例走 main, 每个都往**真**
+# samples.jsonl 里 append 一行假的 9.9.9.9 样本(2026-11-07 实测污染 38 行)。规矩同 RETEST_MARK_NAME:
+# "路径在调用时用 BASE 拼, 模块导入时算死的话, 测试改 BASE 就重定向不动"。
+
 
 SCREEN_CHUNK = 8 * 1024 * 1024
+SPEED_MIN_EL = 0.1            # 速率分母的地板(秒)。8MiB / 0.1s = **80MiB/s ⇒ 8MiB 粗筛在 80MiB/s
+                              # 以上没有分辨率**: 2026-11-07 本地 stub 实测 8MiB 三次全是 80.000,
+                              # 一个字节不差; 而真机 Cn1 工作速率是 95~103MiB/s(v2.3.11 109.6)。
+                              # 这个 0.1 原来只活在 `max(el, 0.1)` 里, 读代码的人看不见「到这里就撞顶」。
+                              # 现在值不变(改口径在本项目已两次引发生产事故), 但三件事必须做:
+                              #   ①抽成常量, 天花板是显式的; ②撞顶由 dl_speed(meta=) 交回 capped,
+                              #   样本记 screen_capped —— 那列从「精确值」变「至少」时不再隐形;
+                              #   ③粗筛同分按 L0 握手 ms 排第二键 —— 原来第二键是 IP 字符串,
+                              #   实测 [(80.0,'8.8.8.8'),(80.0,'116.110.9.9'),(80.0,'1.1.1.1')] 降序,
+                              #   也就是说「谁是冠军」曾由 IP 的字典序决定。
+SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / SPEED_MIN_EL   # 80.0
+                              # **每路**的撞顶线, 不是节点的。这条区别是 v2.3.33 的核心:
+                              # 8MiB/0.1s=80 说的是「这一路在 0.1s 内读完了 8MiB」。SCREEN_WORKERS=4
+                              # 时每路只分到总带宽的 1/4, 要撞 80 得先有 320MiB/s 总带宽 —— NAS 真机
+                              # 3 条样本 143 个粗筛分数: P50 21.6 / P90 35.7 / **max 62.7**, 到 80 的 0 个。
+                              # 也就是说 `screen_capped` 在现行档位下**结构性恒空**, 而"空"有两种含义:
+                              # 「这一档撞不到」(必然) 与「真没人撞」(可能) —— 同形。这是 P1-B
+                              # 「缺席原因必须可辨」的第四遍, 这次钉在 capped 上, 由 screen_cap 分开。
+                              # 反面: 谁"顺手"把它除以 SCREEN_WORKERS 当成节点上限, capped 就永不触发。
 QUICK_CHUNK = 80 * 1024 * 1024
 QUICK_MAX_SEC = 25.0          # 快测/粗筛墙钟上限: 防龟速节点把 80MB 拖成无限长(网络劣化时触发重测正需要它)
 STEADY_MAX_SEC = 8.0          # 稳态下载最长 8s
@@ -362,12 +512,31 @@ SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519_router")
 
 
 def load_ips(path):
-    rows = []
+    """读池文件, 返回 [(ip, tag)]。**读侧也校验**, 不只写侧(pool_refresh)校验。
+
+    v2.3.31: 原来只有 `^([0-9.]+)` 一道正则, 实测收下 `1.2.3.4.5` / `0.0.0.0` / 一个 `192.168.x.x`。
+    池文件是人手也会改的东西, v2.3.25 之前冻结 25 天写进去的脏行还在。三个里前两个只是白等一次
+    超时, 内网地址才有真风险: 局域网里的 HTTP 服务可能被测出高分, 然后被 router_apply 钉进
+    dnsmasq —— 那一步的后果不是"慢", 是整组断网(pool_refresh docstring 记的是同一件事)。
+    校验直接复用写侧那张网段表, 不另抄一份: 两张表就是两个真相。
+    坏行**逐条打出来**, 不静默跳过 —— 池子里有内网地址这件事本身要有人看见。
+    """
+    rows, rejected = [], []
     for line in open(path, encoding="utf-8"):
         s = line.strip()
         m = re.match(r"^([0-9.]+)\s+(.*)$", s)
-        if m:
-            rows.append((m.group(1), m.group(2)))
+        if not m:
+            continue
+        ip, tag = m.group(1), m.group(2)
+        why = ip_reject_reason(ip)
+        if why:
+            rejected.append((ip, why))
+            continue
+        rows.append((ip, tag))
+    if rejected:
+        head = ", ".join("%s(%s)" % r for r in rejected[:6])
+        more = "" if len(rejected) <= 6 else " 等 %d 条" % len(rejected)
+        print(f"[pool] 池文件里有 {len(rejected)} 条不可用地址, 已跳过: {head}{more}", flush=True)
     return rows
 
 
@@ -380,10 +549,17 @@ class BindIPConn(http.client.HTTPConnection):
         self.sock = socket.create_connection((self._bind_ip, self.port or 80), timeout=self.timeout)
 
 
-RANGE_SPAN = 160 * 1024 * 1024   # 单个 Range 请求的字节跨度。**不能**直接对齐 STEADY_MAX_BYTES:
-                                 # 2026-11-07 真机实测 dlassets(Cn2) 对 span=256MB 直接 12s 超时(两个节点都一样),
-                                 # 160MB 才正常(96~103MiB/s)。span 大于 CDN 容忍值时 dl_steady 全返回 0,
-                                 # 又被"当前IP测不出"分支读成"节点已死" —— 一次误判就能把 93 的节点换成 14 的。
+RANGE_SPAN = 160 * 1024 * 1024   # 单个 Range 请求的字节跨度。**不能**直接对齐 STEADY_MAX_BYTES。
+                                 # 降级记账(v2.3.31): 原来这里写的是「dlassets(Cn2) 对 span=256MB 直接
+                                 # 12s 超时(两个节点都一样)」—— 那是 **2026-11-07 某台出口** 的观测,
+                                 # 后来在另一台出口上 256MiB / 512MiB 都返 206(3.6s 收 266MiB)。
+                                 # 也就是说它不是常量规律, 是"那条链路当时的容忍值"。写成规律会让下一个人
+                                 # 既不敢动 watchdog 的 256MiB, 也不敢问"到底是 CDN 还是出口"。
+                                 # 现在的口径: 160MiB 是本机实测能稳过的那一档; watchdog 仍用 256MiB
+                                 # (v2.3.14 决定不动), 两个程序测同一个节点时**跨度不同**, 这一点在
+                                 # watchdog 每轮开头打一行 `[span]` 说明 —— 不可比的地方要看得见, 不是藏起来。
+                                 # span 大于链路容忍值时 dl_steady 全返回 0, 又被"当前IP测不出"分支
+                                 # 读成"节点已死" —— 一次误判就能把 93 的节点换成 14 的。
 
 
 def _req(conn, host, path, start=0, span=RANGE_SPAN):
@@ -395,8 +571,15 @@ def _req(conn, host, path, start=0, span=RANGE_SPAN):
         "User-Agent": "XboxDownload", "Accept-Encoding": "identity"})
 
 
-def dl_speed(ip, host, path, chunk):
-    """快测: 下载 chunk 字节, 速率 = got/el (CDN 突发会虚高, 仅用于排序)"""
+def dl_speed(ip, host, path, chunk, meta=None):
+    """快测: 下载 chunk 字节, 速率 = got/el (CDN 突发会虚高, 仅用于排序)
+
+    v2.3.31 加 `meta=`: 撞上 SPEED_MIN_EL 地板的样本, 返回值其实只是**下界**(至少这么快)。
+    以前这个事实只活在 `max(el, 0.1)` 里, 于是 8MiB 粗筛在 80MiB/s 以上全被写成 80.0,
+    样本 `screen` 列看起来像精确测量。现在经 meta 交回 `el` 与 `capped`, 由调用方决定怎么记。
+    用可选出参而不是改返回值: quick/steady 三条调用点都只吃 float, 改返回类型等于让
+    "速率" 变成 "速率或元组", 每个调用点都得跟着猜(项目里失败出口棘轮也盯着这类改动)。
+    """
     try:
         conn = BindIPConn(host, ip, DL_TIMEOUT)
         _req(conn, host, path)
@@ -415,7 +598,9 @@ def dl_speed(ip, host, path, chunk):
             got += len(b)
         el = time.perf_counter() - t0
         conn.close()
-        return got / (1048576 * max(el, 0.1))
+        if meta is not None:
+            meta.update({"el": el, "capped": el < SPEED_MIN_EL, "bytes": got})
+        return got / (1048576 * max(el, SPEED_MIN_EL))
     except Exception:
         # 单个 IP 异常(断连/超时/不完整响应)只记为 0, 不得拖垮整组
         return 0.0
@@ -591,8 +776,14 @@ def _rtt_min(ip, port=443, tries=RTT_TRIES, timeout=RTT_TIMEOUT):
     return best
 
 
-def rtt_rank(rows, port=443, top=RTT_TOP, budget=RTT_BUDGET_SEC):
+def rtt_rank(rows, port=443, top=RTT_TOP, budget=RTT_BUDGET_SEC, tail=None, stats=None):
     """L0 预筛: 全池 TCP443 握手 min-of-N, 返回 [(ms, ip, tag)] 升序前 top 个。
+
+    `tail` / `stats` 是给样本用的两个观测出口(默认 None = 零开销, 生产调用点必须传):
+      tail  —— 被 top 截掉的**后 8 个** ms。没有它, "RTT_TOP=48 到底漏没漏"不可判定。
+      stats —— {pool, probed, alive}: 池子多大 / 实发几个握手 / 几个通。预算用尽提前收手时,
+               l0 会短于 48 且 tail 为空 —— 那和"池子刚好 48 个"在样本里长得**一模一样**,
+               而这两件事的含义正相反(一个是证据齐全, 一个是根本没测完)。
 
     为什么排序而不是阈值: 阈值的语义是"绝对快慢", 链路一劣化所有节点一起超线、一次砍光;
     排序永远给得出前 top 个, 只是绝对值变大。历史决策过的 21 个节点落在 6.1~36.7ms,
@@ -611,16 +802,18 @@ def rtt_rank(rows, port=443, top=RTT_TOP, budget=RTT_BUDGET_SEC):
         seen.add(ip)
         uniq.append((ip, tag))
     if not uniq:
+        if stats is not None:
+            stats.update({"pool": 0, "probed": 0, "alive": 0})
         return []
     tag_of = dict(uniq)
     t0 = time.perf_counter()
     best = {}
     fut_ip = {}
+    done = 0
     ex = ThreadPoolExecutor(max_workers=RTT_WORKERS)
     try:
         for ip, _tag in uniq:
             fut_ip[ex.submit(_rtt_min, ip, port)] = ip
-        done = 0
         for fut in as_completed(fut_ip):
             ip = fut_ip[fut]
             try:
@@ -641,10 +834,20 @@ def rtt_rank(rows, port=443, top=RTT_TOP, budget=RTT_BUDGET_SEC):
             f.cancel()                        # py3.8 没有 shutdown(cancel_futures=True)
         ex.shutdown(wait=False)               # 正在跑的 RTT_WORKERS 个自然结束(最多 RTT_TRIES×RTT_TIMEOUT)
     out = sorted((ms, ip, tag_of.get(ip, "")) for ip, ms in best.items())
+    if stats is not None:
+        stats.update({"pool": len(uniq), "probed": done, "alive": len(best)})
+    if tail is not None:
+        # 只返回前 top 个, 等于让"RTT_TOP=48 到底漏没漏"不可判定: 第 49 名的握手时间在截断时就没了。
+        # 事后看到"入选的最慢 19ms", 分不清第 49 名是 19.1ms(没漏)还是 12ms(漏了个更近的)。
+        # 尾部 8 个是截断边界唯一的直接证据, 也是将来把 48 改成别的数的依据。
+        # v2.3.31: 记 [ms, ip] 而不是裸 ms —— 一串没有名字的毫秒回答不了"漏掉的是谁",
+        # 既不能补测, 也不能判断 48 该不该调大(审查方 P2-4 实测: 旧 tail 只有 [19.3, 20.1])。
+        tail.extend([round(_m, 1), _ip] for _m, _ip, _t in out[top:top + 8])
     return out[:top]
 
 
-def _screen(rows, host, url_path, budget=SCREEN_BUDGET_SEC):
+def _screen(rows, host, url_path, budget=SCREEN_BUDGET_SEC, ms_of=None, capped_out=None,
+            skip_out=None, zero_out=None, wave_out=None):
     """8MB 粗筛, 返回 [(speed, ip)] 降序。
 
     **总墙钟预算**: 原实现 `ex.map(...)` 会把**全部**节点都跑完才返回 —— 单节点最坏 37s
@@ -652,18 +855,57 @@ def _screen(rows, host, url_path, budget=SCREEN_BUDGET_SEC):
     单节点 cap 封不住总时长, 所以在这里给总预算: 逐条 as_completed 收, 到点且已完成 >= SCREEN_MIN_DONE
     就收手, 未开始的 cancel 掉, 已测的照常排序。
     收手必须**打一行**, 否则日志里只有一个偏小的 "[t] 粗筛 Ns", 读起来像"测完了但都很慢"。
+
+    v2.3.31 两处:
+    - **第二键换成 L0 握手 ms**(`ms_of`), 原来是 IP 字符串。8MiB 在 80MiB/s 以上全撞
+      SPEED_MIN_EL 地板, 于是整段同分, 名次曾由 IP 的字典序决定(实测 8.8.8.8 压过 1.1.1.1)。
+      握手时间是同一台机器上真实测过的数, 比字符串先验强。
+    - **`capped_out`**: 撞地板的 IP 交回调用方记进样本 `screen_capped`。同一段同分时,
+      日志里必须有一行告诉人「此刻粗筛没有分辨率」, 否则 80.0 看起来像测出来的。
+
+    v2.3.32 三处(审查方 P1-A / P1-B / P3-E):
+    - **`wave_out`**: 每个 IP 在**进场那一刻**同批还有几路在跑(含自己), 样本记 `screen_wave`。
+      `SCREEN_WORKERS=4` 意味着 8MiB 的读数被 4 路平分过一次: 真机串行 28.9 / 4 路并发每路 21.3;
+      stub 里 12 个**速率完全一样**的节点喂进来, 分数是 `100/50/33/25×9` —— 前 3 名是「谁先进场」
+      的产物, 与节点质量零关系。原来的样本里没有这一列, 所以「同节点跨轮分数漂移」无法归因到
+      「对手变了」还是「节点变了」。**这一列只是观测, 不改排序**: 先让现象可归因, 再谈怎么改。
+    - **`skip_out` / `zero_out`**: `ranked` 只收 `sp > 0`, 于是「预算用尽没测」与「测了是 0」
+      在样本里**长得一模一样**(都是键不存在) —— 而 `quick` 那边早就有 `quick_skip`、`l0` 那边
+      有 `l0_pool/probed/alive`。同一套「缺席原因必须可辨」写了两遍, 漏了粗筛这一遍。
+    - **空 `ms_of` 的第二键**: `ms_map.get(ip, inf)` 在全空时让每个 IP 都拿 `inf`, 第二键失效、
+      第三键(IP 字符串)接管 —— 实测 `["1.1.1.1","5.5.5.5","9.9.9.9"]` 排成 `1.1.1.1, 5.5.5.5,
+      9.9.9.9`, 与 ms 齐全时**完全相反**。L0 全不通时 `test_pool` 正好走这条分支(`prox` 为空),
+      也就是它**在最该稳的时候**生效。空表时第二键退回池文件原始顺序(至少是人维护过的)。
     """
     ips = [ip for ip, _ in rows]
     uniq = list(dict.fromkeys(ips))          # 池文件理论上已去重, 但同一 IP 两条记录会重复烧一次超时
     if not uniq:
         return []
+    pos = dict((ip, i) for i, ip in enumerate(uniq))
     t0 = time.perf_counter()
     speeds = {}
+    capped = {}
     fut_ip = {}
+    _clock = threading.Lock()
+    _inflight = [0]
+
+    def _run(ip, meta):
+        # wave = 进场时同批在跑的请求数(含自己)。读完再减, 所以它同时是「这一路被平分了几份」。
+        with _clock:
+            _inflight[0] += 1
+            meta["wave"] = _inflight[0]
+        try:
+            return dl_speed(ip, host, url_path, SCREEN_CHUNK, meta)
+        finally:
+            with _clock:
+                _inflight[0] -= 1
+
     ex = ThreadPoolExecutor(max_workers=SCREEN_WORKERS)
     try:
         for ip in uniq:
-            fut_ip[ex.submit(dl_speed, ip, host, url_path, SCREEN_CHUNK)] = ip
+            meta = {}
+            capped[ip] = meta
+            fut_ip[ex.submit(_run, ip, meta)] = ip
         done = 0
         for fut in as_completed(fut_ip):
             ip = fut_ip[fut]
@@ -685,7 +927,36 @@ def _screen(rows, host, url_path, budget=SCREEN_BUDGET_SEC):
         for f in fut_ip:
             f.cancel()                        # py3.8 没有 shutdown(cancel_futures=True)
         ex.shutdown(wait=False)               # 正在跑的 4 个自然结束(最多 37s), 不阻塞主流程
-    return sorted(((sp, ip) for ip, sp in speeds.items() if sp > 0), reverse=True)
+    hit = [ip for ip, m in capped.items() if m.get("capped") and speeds.get(ip, 0) > 0]
+    if capped_out is not None:
+        capped_out.extend(hit)
+    if wave_out is not None:
+        wave_out.update(dict((ip, capped[ip].get("wave")) for ip in speeds))
+    # 三态必须分开: 「预算用尽/被 cancel 没测」(不在 speeds) 与「测了是 0」(在 speeds, 值 0)
+    # 在 ranked 里同样是"键不存在", 而它们对下一轮的含义正相反(一个该补测, 一个该拉黑)。
+    never = [ip for ip in uniq if ip not in speeds]
+    zero = [ip for ip in uniq if ip in speeds and speeds[ip] <= 0]
+    if skip_out is not None:
+        skip_out.extend(never)
+    if zero_out is not None:
+        zero_out.extend(zero)
+    if never:
+        print(f"  粗筛: 有分 {len(speeds) - len(zero)} 个 / 测了 0 分 {len(zero)} 个 / "
+              f"没测到 {len(never)} 个(预算或取消) —— 后两者在 sorted 表里同样缺席, "
+              f"含义相反", flush=True)
+    if len(hit) >= 3:
+        print(f"  粗筛 {len(hit)}/{len([v for v in speeds.values() if v > 0])} 个节点 8MiB 在 "
+              f"{SPEED_MIN_EL:g}s 内读完 => 这些分数只是下界(>= {SPEED_CEIL_MIB:.0f}MiB/s), "
+              f"名次由 L0 握手时间决定", flush=True)
+    ms_map = ms_of or {}
+    if ms_map:
+        _k2 = lambda ip: ms_map.get(ip, float("inf"))       # noqa: E731
+    else:
+        # 空表时退回池文件顺序: 用 inf 会让第二键整段失效、第三键(IP 字符串)接管,
+        # 也就是「握手最快的排到最后」。实测 ms_of={} 时 9.9.9.9(8ms) 掉到第 3。
+        _k2 = lambda ip: pos.get(ip, len(pos))              # noqa: E731
+    ranked = sorted(((-sp, _k2(ip), ip) for ip, sp in speeds.items() if sp > 0))
+    return [(-neg, ip) for neg, _ms, ip in ranked]
 
 
 _NOT_OP_RE = re.compile(r"^(?:[0-9.]+|[a-z0-9-]+(?:\.[a-z0-9-]+)+)$")  # 纯 IP/数字 或 域名
@@ -756,7 +1027,67 @@ def steady_top_diverse(results, exclude, host, url_path, tags, n=2, avoid_ops=()
     return out[:n]
 
 
-def test_pool(name, path, host, url_path, current_ip):
+def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=None,
+                 screen_capped=None, quick_skip=None, screen_skip=None, screen_zero=None,
+                 screen_wave=None, screen_cap=None):
+    """构造 samples.jsonl 的一行 —— **纯函数**: 只吃本轮已测出来的数, 不读盘, 不碰决策。
+
+    字段为什么是这几个:
+      l0      —— 全池握手 min-of-3, 按 ms 升序(前 RTT_TOP 个就是粗筛的入场券)。
+      l0_tail —— 被 top 截掉的**后 8 个** `[ms, ip]`(v2.3.31 起带 IP)。l0 只说"入选的最慢是
+                 19ms", 说不出第 49 名是 19.1ms(没漏)还是 12ms(漏了个更近的); 两个合起来
+                 "48 漏没漏"才可判定。只记裸 ms 时"漏掉的是谁"依然不可知 —— 既不能补测,
+                 也不能判断 48 该不该调大(审查方 P2-4 实测: 旧 tail 只有 [19.3, 20.1])。
+      l0_pool / l0_probed / l0_alive —— 池子多大 / 实发几个握手 / 几个通。预算用尽提前收手时
+                 l0 会短于 48 且 l0_tail 为空, 那与"池子刚好 48 个"在样本里长得一模一样,
+                 含义却正相反。没有这三个数, 空 tail 既可能是没事, 也可能是没测完。
+      screen  —— 粗筛 8MB 分数, 降序。用来回答"候选截断到 16 个丢掉的到底有多差"。
+      screen_capped —— 撞 SPEED_MIN_EL 地板的 IP 列表。8MiB/0.1s = 80MiB/s, 真机 Cn1 工作速率
+                 95~103, 所以 `screen` 里那些 80.0 **只是下界**。没有这个字段, 那一列看起来像
+                 精确测量, 而它其实在说"至少 80"(审查方 P1-1 实测: 三次都是 80.000)。
+      quick   —— 快测 80MB 表(含 0 分)。**缺席的原因看 quick_skip**: 原来"预算跳过"只能靠
+                 "键不存在"推断, 与"测了是 0"混在一起 —— 而 0 分不进 quick, 两者在样本里同形。
+      quick_skip —— 快测预算用尽时被**完全没测**的候选列表。
+      screen_skip / screen_zero —— 粗筛侧的同一件事(v2.3.32, 审查方 P1-B): `ranked` 只收 `sp > 0`,
+                 于是「预算用尽／被 cancel 没测」与「测了是 0」在 `screen` 里**同样是键不存在**,
+                 而两者对下一轮的含义正相反。quick 有 `quick_skip`、l0 有 `l0_pool/probed/alive`,
+                 粗筛这一遍原来漏了 —— 同一个论证写两遍漏一遍。
+      screen_wave —— 每个 IP 粗筛时**进场那一刻**同批在跑的请求数(含自己), 见 `_screen` docstring。
+                 它回答的是「同节点跨轮分数漂移, 是对手变了还是节点变了」: 4 路并发下 8MiB 的读数
+                 本来就是被平分过的一份, 没有这一列就连"这轮分数低"都无法归因。**只观测不改行为。**
+      screen_cap —— 本轮**单路**的撞顶线(MiB/s) = SPEED_CEIL_MIB / max(screen_wave)。80 是每路的,
+                 4 路并存时每路只有 20 —— 也就是说 `screen_capped` 空的时候, 光看它分不清
+                 「这一档根本撞不到」(必然) 与「真没人撞」(可能)。这一列就是那个理由:
+                 空 capped + cap=20.0 ⇒ 结构性; 空 capped + cap=None ⇒ 没记(样本来自旧版);
+                 capped 非空 ⇒ 分数只是下界, 且能拿 cap 复核(分数必须 >= cap)。
+      t_l0    —— L0 耗时。池子越长越慢, 有序列才知道 cron 里 03:50 那口子留得够不够。
+    决策字段(ip/speed/decision)不在这里定: 同一个 IP 可能被后续迟滞判"保持", 样本必须记**最终**
+    落进 results.json 的那个结论, 否则两者会打架。所以那三个由 main 落盘时补上。
+    判定输入(cur/wr/st_cur/st_cand/q_cur)同理不进这里 —— 它们在 test_pool 里还不存在。
+    """
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "group": name,
+        "l0": [[round(ms, 1), ip, tags.get(ip, "").strip()] for ms, ip, _tag in prox],
+        # 尾部 8 个 + 池子三个计数: 缺了它们, "48 漏没漏"和"根本没测完"在样本里分不开
+        "l0_tail": list(l0_tail or []),
+        "l0_pool": (l0_stats or {}).get("pool"),
+        "l0_probed": (l0_stats or {}).get("probed"),
+        "l0_alive": (l0_stats or {}).get("alive"),
+        "screen": [[round(sp, 1), ip] for sp, ip in screen],
+        "screen_capped": list(screen_capped or []),
+        "screen_skip": list(screen_skip or []),
+        "screen_zero": list(screen_zero or []),
+        "screen_wave": dict((k, v) for k, v in (screen_wave or {}).items() if v is not None),
+        # 撞顶线随并发档位变: 记下来, "capped 空"才有理由可读(见 docstring screen_cap)
+        "screen_cap": (round(screen_cap, 1) if screen_cap else None),
+        "quick": {ip: round(sp, 1) for ip, sp in quick.items()},
+        "quick_skip": list(quick_skip or []),
+        "t_l0": round(t_l0, 1),
+    }
+
+
+def test_pool(name, path, host, url_path, current_ip, sample_sink=None):
     t_start = time.perf_counter()   # 分段计时: 2026-11-06 那轮只知道总量 980s, 说不清粗筛/快测各占多少
     full_rows = load_ips(path)
     rows = full_rows
@@ -764,21 +1095,59 @@ def test_pool(name, path, host, url_path, current_ip):
     # L0: RTT 预筛。候选来源从"省份标签 + autoMMDD"换成"实测握手最快的前 RTT_TOP 个" ——
     # 标签会漏(真机 21 个标签外省但 ≤20ms 的近节点从来没进过粗筛), RTT 不会漏, 也不需要人维护。
     # 顺序不能反: 先 RTT 再 8MB 粗筛 —— 粗筛每个节点要拉 8MB, RTT 只握手, 快的先过筛省时间。
-    prox = rtt_rank(rows)
+    _rtt_tail = []
+    _rtt_stats = {}
+    prox = rtt_rank(rows, tail=_rtt_tail, stats=_rtt_stats)
+    # L0 只握 TCP, 不该记在粗筛的账上。此前 t_screen 从 t_start 起算(L0 也含在内),
+    # 于是日志里「粗筛 12s」有近一半是 L0 —— 2026-11-07 对外部审计取证时确认:
+    # 读这行的人会以为该调 SCREEN_WORKERS, 实际那半由 RTT_WORKERS/RTT_TRIES 决定。
+    t_l0 = time.perf_counter() - t_start
     if prox:
         msl = [ms for ms, _, _ in prox]
         inl = sum(1 for _, ip, _ in prox if any(r in tag_of.get(ip, "") for r in SCREEN_REGIONS))
+        # 实发握手数必须打出来: 预算收手时入选数会偏小, 只写"入选 31/274"读起来像"池子里只有
+        # 31 个通的", 实际是"只来得及握 60 个"。样本那边靠 l0_probed/l0_alive 记同一件事。
+        _pr = _rtt_stats.get("probed")
+        _al = _rtt_stats.get("alive")
+        _cut = "" if (_pr is None or _al is None or _pr >= len(rows)) else \
+               f", 实发握手 {_pr}/{len(rows)} 通 {_al} 个"
         print(f"[{name}] RTT 预筛: 入选 {len(prox)}/{len(rows)} 个 "
               f"(最慢 {msl[-1]:.0f}ms, 中位 {msl[len(msl) // 2]:.0f}ms, "
-              f"其中 {','.join(SCREEN_REGIONS)} 标签 {inl} 个)", flush=True)
+              f"其中 {','.join(SCREEN_REGIONS)} 标签 {inl} 个{_cut})", flush=True)
         screen_rows = [(ip, tag) for _, ip, tag in prox]
+        # 截断边界: 入选的最慢 ×1.05 以内的尾部节点就是"48 可能挡住的那几个"。
+        # 只打一行、**不自动补测** —— 补测会改候选集, 而这一轮的口径是"先把证据留下"。
+        # 有这一行, "48 该不该调大"才有据; 没有它, tail 只是一串数字(v2.3.31 起带 IP)。
+        if len(prox) >= RTT_TOP and _rtt_tail:
+            edge = prox[-1][0] * 1.05
+            near = [t for t in _rtt_tail if t[0] <= edge]
+            if near:
+                print(f"  RTT 边界: 入选最慢 {prox[-1][0]:.0f}ms, 尾部 {len(_rtt_tail)} 个里 "
+                      f"{len(near)} 个在 1.05 倍内("
+                      f"{', '.join('%s@%.0fms' % (t[1], t[0]) for t in near[:4])}) —— 它们是被 48 挡住的那批",
+                      flush=True)
     else:
         # L0 全都不通(链路真断/池文件全脏): 退回全池粗筛, 让粗筛自己的超时兜底。
         # 不能在这里返回空 —— 那等于"一轮网络抖动就把整组判成无冠军"。
         print(f"[{name}] RTT 预筛无可达节点, 退回全池粗筛", flush=True)
         screen_rows = rows
-    ranked = _screen(screen_rows, host, url_path)
-    t_screen = time.perf_counter() - t_start
+    _screen_capped = []
+    _screen_skip = []
+    _screen_zero = []
+    _screen_wave = {}
+    ranked = _screen(screen_rows, host, url_path,
+                     ms_of=dict((ip, ms) for ms, ip, _t in prox), capped_out=_screen_capped,
+                     skip_out=_screen_skip, zero_out=_screen_zero, wave_out=_screen_wave)
+    t_screen = time.perf_counter() - t_start - t_l0
+    # 撞顶线是**每路**的, 所以它随并发档位变: 4 路并存时每路只分到总带宽的 1/4, 要撞
+    # 80MiB/s 得先有 320MiB/s 总带宽。真机取证 (NAS samples.jsonl 3 条 / 143 个粗筛分数):
+    # P50 21.6 / P90 35.7 / max 62.7 / 到 80 的 0 个 ⇒ `screen_capped` 在现行档位下结构性恒空。
+    # 而这个"空"与"真没人撞"同形 —— P1-B 那个论证的第四遍, 这次钉在 capped 上。
+    _wave_max = max(_screen_wave.values()) if _screen_wave else 0
+    _cap_line = (SPEED_CEIL_MIB / _wave_max) if _wave_max else SPEED_CEIL_MIB
+    if not _screen_capped and _wave_max > 1:
+        print(f"  粗筛: 最大并发 {_wave_max} 路 ⇒ 单路撞顶线只有 {_cap_line:.1f}MiB/s"
+              f"(串行才是 {SPEED_CEIL_MIB:.0f}); capped 空是这一档撞不到, 不是没人撞", flush=True)
     top = [ip for _, ip in ranked[:SCREEN_N]]
     # 本地省份节点保送确认: 粗筛小块+并发会低估本地节点, 防止漏选(本地运营商节点延迟优势最大)。
     # 保送名单只从 L0 入选者里取 —— 标签不能再把慢节点塞进快测, 但可以在入选者里优先。
@@ -807,15 +1176,31 @@ def test_pool(name, path, host, url_path, current_ip):
     # results 又只保留 sp>0 的项 —— "预算跳过" 与 "测了是 0" 在 results 里长得一模一样,
     # main 一律读成 cur_alive=False。2026-11-07 之前这条路径没被踩到只是因为预算够用, 属于运气。
     order = ([current_ip] if current_ip in cands else []) + [i for i in cands if i != current_ip]
+    quick_skip = []
     for ip in order:
         left = QUICK_BUDGET_SEC - (time.perf_counter() - t_q)
         if quick and left <= 0:
-            print(f"  快测预算 {QUICK_BUDGET_SEC:.0f}s 用尽, 余 {len(order) - len(quick)} 个候选跳过(用已测最优)",
+            # v2.3.31: 跳过的候选要**点名记下来**。原来只有一句总数, 而样本里"预算跳过"
+            # 只能靠"quick 缺键"推断 —— 0 分也不进 quick, 于是"没测"和"测了是 0"同形。
+            quick_skip = [i for i in order if i not in quick]
+            print(f"  快测预算 {QUICK_BUDGET_SEC:.0f}s 用尽, 余 {len(quick_skip)} 个候选跳过(用已测最优)",
                   flush=True)
             break
         quick[ip] = median_quick(ip, host, url_path)
-    t_quick = time.perf_counter() - t_start - t_screen
-    print(f"  [t] 粗筛 {t_screen:.0f}s / 快测 {t_quick:.0f}s / 快测出数 {len(quick)} 个", flush=True)
+    t_quick = time.perf_counter() - t_start - t_l0 - t_screen
+    print(f"  [t] L0 {t_l0:.0f}s / 粗筛 {t_screen:.0f}s / 快测 {t_quick:.0f}s / 快测出数 {len(quick)} 个",
+          flush=True)
+    # 样本在这里就交出去: 它只依赖本轮已测出来的数。放在 return 之前, 是为了让"全组 0 分"的那几轮
+    # 也留下分布 —— 只 return None 的话 samples.jsonl 在坏日子里整段空白, 三个月后回放会得出
+    # "这网一直很稳", 而它只是把坏日子丢了。
+    # 走 sink 参数而不是塞进返回值: `return None` 是这条链上**唯一**的失败出口(B1 棘轮钉着),
+    # 为了记一行日志把它改成 dict, 等于把"没有结果"变成"结果的一种", 棘轮也只能跟着删行。
+    _smp = build_sample(name, t_l0, prox, ranked, quick, tag_of, _rtt_tail, _rtt_stats,
+                        screen_capped=_screen_capped, quick_skip=quick_skip,
+                        screen_skip=_screen_skip, screen_zero=_screen_zero,
+                        screen_wave=_screen_wave, screen_cap=_cap_line)
+    if sample_sink is not None:
+        sample_sink.append(_smp)
     # 预算提前 break 时 quick 里没有剩余候选的键, 必须按 quick 取而不是按 cands(否则 KeyError)
     results = sorted(((sp_, ip_) for ip_, sp_ in quick.items() if sp_ > 0), reverse=True)
     if not results:
@@ -863,6 +1248,42 @@ def router_apply(domains, ip, current):
         # 而下一轮从 uci 读到的"当前IP"已是新值, 差异消失, 假账会被永久固化(与 watchdog 同一条规矩)
         return False, "uci committed but dnsmasq restart FAILED"
     return True, "dnsmasq updated+restarted"
+
+
+def write_samples(samples, summary, decisions=None):
+    """把本轮样本 append 进 samples.jsonl, 返回写入行数。**决策不读它, 它也不读决策**。
+
+    为什么单独成函数: 落盘路径必须有地方能实测(C72 拿临时文件跑两轮, 断言第二轮的 append
+    不会把第一轮抹掉)。埋在 main() 里时只能靠数文本, 而文本断言恰好抓不到"把 a 改成 w"
+    这种最要命的形态 —— 覆盖写不会报错, 只会让昨天的分布安静消失。
+
+    写失败不抛: results.json 已经落盘, 样本缺一行不该连累整轮结论; 但必须打出来 —— 静默吞掉
+    的话, 三个月后复盘会发现样本有个洞, 却没人知道洞是从哪天开始的。
+
+    路径现拼(不取模块常量): 审计把 BASE 指到临时目录就跑得到这个文件, 真文件一个字不动。
+    """
+    _final = {g.get("group"): g for g in summary if isinstance(g, dict)}
+    _dec = decisions or {}
+    _path = os.path.join(BASE, "samples.jsonl")   # 调用时拼, 见上面常量区的污染记录
+    n = 0
+    try:
+        with open(_path, "a", encoding="utf-8") as f:
+            for _s in samples:
+                _g = _final.get(_s.get("group")) or {}
+                # 判定输入先并进去, 再补结论。两者缺一不可: 只有"赢了/保持"这个结论,
+                # 回放回答不了"WIN_RATIO 从 1.30 改 1.15 会多换几次"。
+                _s.update(_dec.get(_s.get("group")) or {})
+                _s["ip"] = _g.get("ip")
+                _s["speed"] = _g.get("speed")
+                # 组不在 summary 里 = 这轮没冠军(快测全 0)或抛异常。空串会被回放读成"字段缺失",
+                # 与"这一轮确实没有决策"是两件事, 而后者正是最该被记住的那种日子。
+                _s["decision"] = _g.get("router") or ("no winner (本组快测全 0)" if not _g else "")
+                f.write(json.dumps(_s, ensure_ascii=False) + "\n")
+                n += 1
+        print(f"[samples] 追加 {n} 行 -> samples.jsonl", flush=True)
+    except Exception as _e:
+        print(f"[warn] samples 落盘失败({_e}), 本轮结论不受影响", flush=True)
+    return n
 
 
 def main():
@@ -928,9 +1349,11 @@ def main():
     print(f"=== Xbox 测速 {time.strftime('%Y-%m-%d %H:%M:%S')} 当前IP: " +
           " ".join(f"{n}={v}" for n, v in cur_ip.items() if n in [p[0] for p in pools]), flush=True)
     summary = []
+    samples = []                     # 每组的闭环样本, results.json 落盘之后统一 append
+    dec = {}                         # 每组的判定输入(cur/wr/st_cur/st_cand), 落样本时合并
     for name, path, host, url_path, doms in pools:
         try:
-            r = test_pool(name, path, host, url_path, cur_ip[name])
+            r = test_pool(name, path, host, url_path, cur_ip[name], sample_sink=samples)
         except Exception as e:
             print(f"  [err] {name}: {e}", flush=True)
             continue
@@ -943,6 +1366,8 @@ def main():
         r.pop("rows", None)        # 全池明细不落盘(看门狗只用 hotspares, 白占体积)
         tags = r.pop("tag_of", {})   # 热备分散要用运营商标签, 但不落盘
         r.pop("_t", None)            # 分段计时只给人看, 不进 results.json
+        # 样本由 test_pool 经 sample_sink 直接交给 samples, 不经过 r —— results.json 里
+        # 只出现冠军与热备这两类结论, watchdog 读的那个文件不会被分布灌胖。
         if cand == cur_ip[name]:
             # 冠军自己的稳态必须测: 只存快测中位数会让看门狗拿它当劣化基准(快测虚高 -> 劣化误判),
             # 且 hotspares[0]=冠军 是 load_record 的取值前提
@@ -981,6 +1406,11 @@ def main():
                 # 一律记 apply FAILED。这条分支曾经因为"不落盘"出过事, 别再让它因为"不记账"出一次。
                 r["router"] = "same ip, residue apply FAILED: " + _det
                 print(f"  [router] 同 IP 残留修复失败({_det}), 路由器仍不一致, 待下一轮重试", flush=True)
+            # 同 IP 分支没有"候选 vs 当前"的比较, 但样本仍要记全: 冠军就是当前 IP, st_cur 与
+            # st_cand 同源(st_self)。回放时这一行回答的是"这一轮本来就没得换", 不是"缺字段"。
+            dec[name] = {"cur": cand, "wr": WIN_RATIO.get(name, 1.15),
+                         "st_cur": round(st_self, 1), "st_cand": round(st_self, 1),
+                         "q_cur": round(quick.get(cand, 0.0), 1), "note": ""}
             continue
         # 稳态复测: 冠军候选 vs 当前IP, 赢迟滞阈值才换(摊平突发, 防虚高换节点)
         st_cand = median_steady(cand, host, url_path)
@@ -1084,6 +1514,13 @@ def main():
                                                      known=known_measured))
                 print(f"  [router] 切换到 {cand} 失败({detail}), 实际仍为 {cur_ip[name]}, 待下轮重试", flush=True)
         summary.append(r)
+        # 样本必须带**判定输入**(st_cand / st_cur / wr), 不能只有判定结果:
+        # 阈值讨论要回答的是"WIN_RATIO 1.30 改 1.15 会多换几次、每次换来多少 MiB/s",
+        # 而这三个数此前只活在 router 的散文里(kept 分支还写了数, 切换分支一个数都没有),
+        # 回放只能靠正则抠文案。q_cur 一并记: 它是"活/死"判定的唯一依据。
+        dec[name] = {"cur": cur_ip[name] or None, "wr": wr,
+                     "st_cur": round(st_cur, 1), "st_cand": round(st_cand, 1),
+                     "q_cur": round(q_cur, 1), "note": _note}
     elapsed = int(time.time() - t0)
     # 流量账: 2026-11-06 NAS 网卡计数器实测一轮全量收 9.58GiB, 此前没人算过也没人看过。
     # 稳态每次 256MiB × 3 轮 × 每个**实际开测的节点**, 是这轮流量的绝对大头, 必须打在日志里可核对。
@@ -1107,6 +1544,10 @@ def main():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
     os.replace(tmp, out_path)
+    # samples.jsonl: 每轮每组一行, 只 append。**决策一次都不读它** —— 读回就会悄悄改变行为,
+    # 而这条项目在"看着像没变其实变了"上吃过太多次亏(A24 把这条钉住: 除了 append,
+    # 源码里不许有第二个引用)。
+    write_samples(samples, summary, dec)
     log_line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {elapsed}s " +
                 " | ".join(f"{g['group']}={g['ip']}({g['speed']}MiB/s,{g['router']})" for g in summary))
     with open(os.path.join(BASE, "speed.log"), "a", encoding="utf-8") as f:

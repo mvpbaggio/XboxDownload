@@ -1,13 +1,57 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Xbox 加速看门狗 v2.3.26: 每小时体检两组钉住 IP (TCP 连通 + 稳态吞吐),
+Xbox 加速看门狗 v2.3.33: 每小时体检两组钉住 IP (TCP 连通 + 稳态吞吐),
 任一组死掉、吞吐 < 8MiB/s、或掉到记录值一半以下(degraded) =>
   1) 热备止血: 读 results.json 的 hotspares(NAS 上轮全量测速验证过的次优节点),
      逐个用热备自己的测速对实测 8s, 第一个达标的**整组域名一起** uci 切过去 (分钟级恢复, 不等全量重测)
      达标线: 死/极慢 >= 20MiB/s; 只是劣化则还要比当前实测再快 10%(否则越止越慢)
   2) 定向重测: 触发 xbox-speedtest.py --pool <坏组> (只重测坏组, 不再全池 3.2h)
      **带 3 小时冷却**(RETEST_COOLDOWN): 冷却期内只做第 1 步止血, 不重测。
+v2.3.33 (2026-11-08 第二十九轮 —— 本文件**一行未改**, 版本号只跟着主程序走):
+  - 主程序这轮加了「本轮单路撞顶线」(`SPEED_CEIL_MIB / max(screen_wave)` → 样本 `screen_cap`),
+    解释 `screen_capped` 为什么在 4 路并发下结构性恒空。纯观测字段, 与看门狗无关。
+  - 版本号必须跟 A6 对齐(两脚本版本号不一致会红), 所以同步到这里; 别把这条当成"改了看门狗"。
+v2.3.32 (2026-11-08 第二十八轮 —— 外部审查 P2-C, 阈值一个未动):
+  - (P2-C) `[span]` 那行把主程序的 `RANGE_SPAN` 抄成**字面量** 160MiB。A23 只比 README ↔ 代码,
+    不比**代码 ↔ 代码**, 于是主程序把跨度改成 140/180 时这行照旧念 160 —— 而它存在的全部意义
+    就是「让人知道两把尺子不一样」。抄一份这件事本身留下来了(本程序不该为了打一行日志去 import
+    主程序: 它崩了看门狗就一起崩), 但漂移现在由审计 **C79** 钉住, 改一处忘另一处会红。
+v2.3.31 (2026-11-07 第二十七轮 —— 外部审查 P1-2 / P1-3 / P3-7, 阈值一个未动):
+  - (P1-2) **canary 的返回值终于进决策了**。原来 `for _cn in CANARY: canary(_cn)` 把 bool 扔掉,
+    于是撤版那天: canary 打一行 404, 接着 `classify(0.0)` 判 dead -> 逐个试热备(每个 256MiB 全 0)
+    -> 触发定向重测。每组每小时约 1GiB, 两组约 2GiB, 全打在一个 404 上; 还把钉住的 IP 换到
+    一个没验证过的节点。现在 `canary_gate()` 汇总三档:
+      404/410          -> **当轮闸门**: 只告警, 不判死、不止血、不重测(直接 return, 省掉 2GiB);
+      401/403/429      -> 本轮 0 **不可信**(限流/风控也会让 steady=0): 判 `unmeasured`, 不判死;
+      其余(5xx/连不上) -> 不下结论, 体检照做 —— 本机出网断了不该影响"钉住 IP 是否可用"的判断。
+    反证 M94: 把 gate 恒返回 "ok" -> C73 红。
+  - (P1-3) **Cn2 的相对劣化档实际失效**: `DEGRADE_MIN_RECORD=25` 是照 Cn1 的 100MiB/s 量级定的,
+    而 v2.3.8 ⑦ 自己写明 Cn2 测自己那份大包时记录区间是 21~24 —— `rec >= 25` 在那组基本恒假。
+    实测 `classify(9.0, 23.9)` 返回 `ok`: 从 24 掉到 9(-62%)判正常。现在门槛分组
+    `{'Cn1': 25.0, 'Cn2': 10.0}`, `classify(sp, rec, floor=)` 收组内门槛(默认 25.0,
+    旧调用点行为不变)。**Cn1 不动**: 它的记录值本来就在 100 量级。
+  - (P3-7) 两个程序测同一个节点用的跨度不同(这里 256MiB, 主程序 160MiB)。**跨度不动** —— 改口径
+    在本项目已两次引发生产事故(v2.3.7 把 Cn2 打瞎、v2.3.8 才收回), 而 v2.3.14 已用真机证明
+    256MiB 在这条链路上能过。改的是**说法**: 每轮开头打一行 `[span]`, 让"两者不可比"看得见。
+v2.3.30 (2026-11-07 第二十六轮 —— **决策逻辑零改动**, 只改 canary 的文案分层):
+  canary 原来把 401/403/429/5xx 与 404 报成**逐字相同**的一句话, 全叫人「去换 build」。
+  实测(桩 403/429/503)确认四档同文。后果不是漏报, 是**指错方向**: 403 多半是这台出口被限流,
+  换了 build 明天照样 403, 然后人会开始怀疑 build 号本身。现在分三档: 404/410 = 撤版(换 build);
+  401/403/429 = 被拒(先别换, 连续 3 次同一状态再按撤版处理); 其余 = 不下结论, 看下一小时。
+  反证 M91: 把判断改成 `st >= 400` 一律当撤版 -> C71 红。
+v2.3.28 (2026-11-07 第二十四轮 —— **有运行行为改动**, 但只在日志面): 新增 `canary()`, 每小时对
+  Cn2 的**版本化 URL** 发一个 HEAD, 非 200/206 打一行点名。Cn2 的 TESTPATH 里带着 build 号,
+  一撤, 测速与体检用的是同一个 URL —— 同一时刻一起瞎, 日志里只剩 `steady=0.0`, 读起来像"网烂了"。
+  canary 买不到"提前 N 天"(CDN 有没有预警期一次都没观测过), 买的是**点名**。
+  三条边各有反证: 走 DNS 不绑 IP(M86: 绑 IP 时单台节点坏了会伪装成 URL 下架)/ 只发 HEAD 且 Range
+  只要 1 字节 / 200 与 206 都算活(M85: 只认 200 会每小时误报一次)。它不参与任何决策, 只打日志。
+v2.3.29 (2026-11-07 第二十五轮): 本文件**零改动**, 只随交付升版本号(A6 要求两脚本版本一致)。
+  这轮修的是主程序 `samples.jsonl` 的落盘路径(模块常量 -> 调用时 BASE 拼, 审计跑 main 会污染
+  真文件), 与本文件的 canary/体检逻辑无交集。新增的 A26 在本文件上也生效: 审计前后
+  `run.log` / `results.json` 必须一字节不动。
+v2.3.27 (2026-11-07 第二十三轮): 本文件**零改动**, 只随交付升版本号(A6 要求两脚本版本一致)。
+  这轮动的是主程序的**分段计时**(L0 从「粗筛」账里拆出来, 只影响一行日志), 与本文件无交集。
 v2.3.26 (2026-11-07 第十九轮): 本文件**零改动**, 只随交付升版本号(A6 要求两脚本版本一致)。
   改的是测速主程序的候选来源(省份标签 -> 实测 RTT 排序), 与本文件无交集。
   这轮动的是主程序的**候选来源**: L0 用 `rtt_rank`(全池 TCP443 握手 min-of-3, 升序取前 RTT_TOP=48)
@@ -188,7 +232,14 @@ THRESHOLD_MIBS = 8.0
 # 相对劣化: 绝对阈值封不住"慢慢烂掉"——2026-11-06 实测 Cn1 从 108 一路 43.8(18:30)/10.6(19:30)/0.8(20:30),
 # 前两小时都判 ok, 用户实际半速跑了两小时才等到切换。低于记录值一半就提前动手。
 DEGRADE_RATIO = 0.55           # 实测 < 记录稳态 * 0.55 判 degraded
-DEGRADE_MIN_RECORD = 25.0      # 记录值本身不到这个数不做相对判定(本就不快的节点别抖)
+DEGRADE_MIN_RECORD = {"Cn1": 25.0, "Cn2": 10.0}   # 记录值本身不到这个数不做相对判定(本就不快的节点别抖)
+DEGRADE_MIN_RECORD_DEFAULT = 25.0                 # 未登记的组按 Cn1 量级处理(保守 = 少报)
+# v2.3.31: 分组。原来一个 25.0 通吃, 那是照 Cn1 的 100MiB/s 量级定的; 而 v2.3.8 ⑦ 自己写着
+# "Cn1 文件 98~105、Cn2 自己的包 21~24", 也就是说 Cn2 的记录值**基本恒 < 25** ->
+# `rec >= DEGRADE_MIN_RECORD` 在那组恒假 -> degraded 档永不触发, 只剩 8MiB/s 绝对线。
+# 实测取证: classify(9.0, 23.9) 返回 ('ok','ok') —— 从 24 掉到 9(-62%)判"稳定"。
+# 10.0 是从 Cn2 的记录区间(14.1/20.6/21.3/23.9)下沿取的: 放得进"这组能到 21~24"的事实,
+# 又不会让"本来就 12 的节点"参与相对判定。Cn1 的 25.0 **不动**(它的记录值在 100 量级)。
 HOTSPARE_MIN_MIBS = 20.0      # 止血门槛: 热备实测 >= 此值才切(且必须显著高于 THRESHOLD)
 DL_TIMEOUT = 12.0
 STEADY = 8.0
@@ -367,6 +418,97 @@ def steady(ip, host, path):
         return 0.0
 
 
+CANARY = ("Cn2",)   # 只对**版本化 URL** 做体检。Cn1 的 /Z/routing/extraextralarge.txt 是静态路径,
+                    # 不会随某个 build 下架; Cn2 的 path 里带着 `1.5.0.1018.88cd...` 那串 build。
+
+
+def canary(name, state=None):
+    """版本化 URL 体检: 一个 HEAD 回答"那串 build 还在不在"。
+
+    为什么要有这条: Cn2 的 TESTPATH 里带着 build 号, 一撤, **测速和看门狗用的是同一个 URL**,
+    于是体检/止血/重测在同一时刻一起瞎 —— 日志里只剩 steady=0.0, 读起来像"网烂了",
+    实际是"我们去下载的那个文件没了"。canary 买不到"提前 N 天"(CDN 有没有预警期我们一次都没
+    观测过, 可能当天就 404), 它买的是**点名**: `[canary] Cn2 HTTP 404` 比 `steady=0.0`
+    少掉三小时的"是不是我的网/路由器"。
+
+    两条硬约束, 各有反证(M83/M84):
+    - **必须走 DNS, 不能绑 IP**。绑 IP 时"这台节点坏了"会伪装成"URL 下架", 假警报比不报更有害
+      (叫狼来了的次数多了, 真下架那天没人看)。所以这里用明文 HTTPConnection, 不用 BindIPConn。
+    - 只发 HEAD 且 Range 只要 1 字节: 每小时一次, 代价几百字节, 不碰 40GiB 的包体。
+    - **三种"不 OK"必须长得不一样**: 404/410 才是"文件没了"; 401/403/429 是被拒(限流/风控/
+      撤版预警), 照着"换 build"动手就白忙一场; 5xx 偶发更是常态, 不许下任何结论。
+    - v2.3.31: 返回值不再只是给人看的。`state` 是回执字典, 写 `ok/gone/denied/unknown/failed`
+      五档, 由 `canary_gate()` 汇总成当轮闸门 —— 原来 main 里 `canary(_cn)` 的 bool 被直接扔掉,
+      于是"文件没了"和"节点死了"在下面那条 8s 体检里长得一模一样, 一路止到热备去。
+    """
+    try:
+        # 必须是 **HTTP** 不是 HTTPS: 测速与体检走的就是 http.client.HTTPConnection + Host 头
+        # (BindIPConn 的基类), 从没做过 TLS 校验。2026-11-07 18:46 在 NAS 上实测: 换 HTTPS 后
+        # 真 URL 直接 SSLCertVerificationError(Hostname mismatch) —— canary 每小时报警, 而下载
+        # 一直好好的。用 HTTPS 等于给"体检"加了一道被体检对象不遵守的门。
+        conn = http.client.HTTPConnection(DOMAIN[name], timeout=DL_TIMEOUT)
+        conn.request("HEAD", TESTPATH[name], headers={
+            "Host": DOMAIN[name], "Range": "bytes=0-0", "User-Agent": "XboxDownload"})
+        resp = conn.getresponse()
+        st = resp.status
+        resp.close()
+        conn.close()
+    except Exception as e:
+        print(f"{ts()} [canary] {name} HEAD 失败({e.__class__.__name__}: {e}) —— 可能 URL 已失效, "
+              f"也可能是本机出网断了; 先看这条再怀疑别的", flush=True)
+        if state is not None:
+            state[name] = "failed"     # 连不上 ≠ 撤版: 这条**不许**触发闸门, 见 canary_gate
+        return False
+    ok = st in (200, 206)
+    if not ok:
+        # 三档必须分开, 否则运维照着错的方向动手。2026-11-07 实测: 403/429/503 与 404 打出来的
+        # 是**逐字相同**的一句话, 全叫人「去换 build」—— 而 403 很可能只是这台出口被限流,
+        # 换了 build 明天照样 403, 然后人会开始怀疑 build 号本身。
+        if st in (404, 410):
+            if state is not None:
+                state[name] = "gone"
+            print(f"{ts()} [canary] {name} HTTP {st} {DOMAIN[name]}{TESTPATH[name][:64]}... "
+                  f"—— 版本化 URL 疑似撤版: 测速与体检用的是同一个 URL, 今晚 04:00 那轮大概率全 0, "
+                  f"去换 build 而不是调阈值", flush=True)
+        elif st in (401, 403, 429):
+            if state is not None:
+                state[name] = "denied"
+            print(f"{ts()} [canary] {name} HTTP {st} {DOMAIN[name]}{TESTPATH[name][:64]}... "
+                  f"—— 被拒, 不是不存在: 可能出口 IP 被限流/风控, 也可能正处在撤版预警期"
+                  f"(有没有预警期一次都没观测过)。先别换 build —— 连续 3 次同一状态再按撤版处理, "
+                  f"中间出现 200/206 就作废", flush=True)
+        else:
+            if state is not None:
+                state[name] = "unknown"
+            print(f"{ts()} [canary] {name} HTTP {st} {DOMAIN[name]}{TESTPATH[name][:64]}... "
+                  f"—— 服务端这次没给内容。这不是「文件不存在」, 不下结论: 先看下一小时"
+                  f"是不是同一个状态(5xx 偶发几次很正常)", flush=True)
+    elif state is not None:
+        state[name] = "ok"
+    return ok
+
+
+def canary_gate(names=None):
+    """把每组的 canary 档位收成一个**当轮闸门**, 返回 (gate, 明细)。
+
+    gate:
+      "gone"     —— 有版本化 URL 返回 404/410。这一轮**不判死、不止血、不重测**: 0.0 不是节点的问题,
+                    拿它去止血等于把钉住的 IP 换成一个没验证过的节点, 还每小时白烧约 2GiB。
+      "denied"   —— 401/403/429。0 **不可信**(限流/风控同样让 steady=0), 判 `unmeasured` 而不是 dead。
+      "unknown"  —— 5xx。不下结论, 体检照做(5xx 偶发不能停掉整个看门狗)。
+      "ok"/"failed" —— 都按正常体检走。`failed` (HEAD 连不上) 尤其**不能**当撤版:
+                    本机出网断了的时候, "钉住 IP 是否可用"仍然值得测。
+    优先级 gone > denied > unknown: 一条 404 就能解释整轮的 0, 别的档位都是次要信息。
+    """
+    st = {}
+    for name in (names or CANARY):
+        canary(name, state=st)
+    for want in ("gone", "denied", "unknown"):
+        if want in st.values():
+            return want, st
+    return "ok", st
+
+
 def load_hotspares(name):
     """读上轮 speedtest 写入的热备名单 [{ip, steady}, ...]"""
     try:
@@ -487,13 +629,26 @@ def quick_fix(name, pinned_ip, floor_mibs=HOTSPARE_MIN_MIBS, other_pins=()):
     return None
 
 
-def classify(sp, rec):
-    """返回 (kind, 打印用label)。kind: dead / slow / degraded / ok"""
+def classify(sp, rec, floor=None, untrusted=False):
+    """返回 (kind, 打印用label)。kind: dead / slow / degraded / ok / unmeasured
+
+    v2.3.31 两个参数:
+    - `floor`: 组内"记录值够不够做相对判定"的门槛。默认 25.0(= 老行为), main 传
+      `DEGRADE_MIN_RECORD.get(name, DEGRADE_MIN_RECORD_DEFAULT)`。给 Cn2 传 10.0 的原因写在
+      常量注释里: 那组的记录区间是 21~24, 用 25 当门槛等于**永久关掉相对劣化档**。
+    - `untrusted`: 本轮 canary 被拒(401/403/429)。此时 steady=0 **不能**读成"节点死了" ——
+      限流/风控同样让吞吐归零。返回 `unmeasured`, 它既不进 bad 也不触发止血。
+      `unmeasured != ok` 但也不是 dead: 这两件事在日志里必须长得不一样, 否则下一个人会去查
+      一台其实好好的节点。
+    """
     if sp == 0:
+        if untrusted:
+            return "unmeasured", "unmeasured(canary 被拒, 0 不可信)"
         return "dead", "dead"
     if sp < THRESHOLD_MIBS:
         return "slow", f"slow({sp:.1f}<{THRESHOLD_MIBS})"
-    if rec >= DEGRADE_MIN_RECORD and sp < rec * DEGRADE_RATIO:
+    lim = DEGRADE_MIN_RECORD_DEFAULT if floor is None else floor
+    if rec >= lim and sp < rec * DEGRADE_RATIO:
         return "degraded", f"degraded({sp:.1f} < 记录 {rec:.1f}*{DEGRADE_RATIO})"
     return "ok", "ok"
 
@@ -555,6 +710,33 @@ def main():
         except Exception:
             print("已有看门狗实例, 退出", flush=True)
             return
+    # 版本化 URL 体检放在最前面: 它解释的是"为什么下面可能全是 0"。顺序反了, 人会先看到一堆
+    # 坏消息再去猜原因; 而且它不依赖路由器, 所以 ssh 挂掉时这一行反而更有用。
+    # v2.3.31: 返回值不再扔掉 —— 见 canary_gate。原来这两行的 bool 谁都不接, 于是 404 那天
+    # 一行告警之后照旧 classify(0.0)=dead -> 试热备(每个 256MiB 全 0) -> 定向重测,
+    # 每小时约 2GiB 打在一个已经不存在的 URL 上, 还把钉住的 IP 换掉。
+    gate, gate_state = canary_gate()
+    if gate == "gone":
+        print(f"{ts()} [canary] 撤版闸门: {gate_state} —— 本轮**不判死、不止血、不重测**。"
+              f"0.0 不是节点的问题: 现在拿它止血等于把钉住的 IP 换成一个没验证过的节点,"
+              f"还要白烧约 2GiB。先去换 build(测速与体检用的是同一个 URL)", flush=True)
+        return
+    if gate == "denied":
+        print(f"{ts()} [canary] 出口被拒({gate_state}): 本轮 steady=0 记 `unmeasured`, 不判死、不止血。"
+              f"限流/风控和「节点坏了」在吞吐上长得一模一样, 这一档只能等下一小时", flush=True)
+    elif gate == "unknown":
+        print(f"{ts()} [canary] 服务端没给内容({gate_state}): 5xx 偶发是常态, 本轮不下结论、照常体检",
+              flush=True)
+    untrusted = (gate == "denied")
+    # P3-7: 两个程序测同一个节点用的跨度不同(这里 256MiB, 主程序 RANGE_SPAN=160MiB)。
+    # 跨度**不动**(改口径已两次引发事故, v2.3.14 用真机证明 256MiB 能过), 但要让人看见 ——
+    # 否则 `hotspares.steady` 与本轮的 `speed` 被当成同一把尺子。
+    # 下面那个 160MiB 是**抄来的字面量**, 不是从 RANGE_SPAN 读的: 本程序不该为了打一行日志去
+    # import 主程序(它崩了看门狗就一起崩, 而看门狗存在的意义正是主程序出问题时还在跑)。
+    # 抄一份就有漂移风险, 所以审计 C79 钉着「这行里的数 == 主程序的 RANGE_SPAN>>20」——
+    # 改跨度时这行忘了改会红, 而不是让人从一行假数里推错尺子(v2.3.32, 审查方 P2-C)。
+    print(f"{ts()} [span] 本程序稳态跨度 {STEADY_MAX_BYTES >> 20}MiB × {STEADY:.0f}s 窗口; "
+          f"xbox-speedtest 的 RANGE_SPAN 是 160MiB —— 同一节点两边的数只在本窗口内可比", flush=True)
     pins = get_pins()
     if pins is None:
         print(f"{ts()} [skip] 路由器 ssh 不可达(读 uci 失败): 本轮不体检也不止血, 去查 ssh/密钥/路由", flush=True)
@@ -575,7 +757,13 @@ def main():
         if rec <= 0 and sp >= THRESHOLD_MIBS:
             # "没触发 degraded" 与 "没有基准所以没判" 在日志里必须长得不一样, 否则基准丢了看不见
             print(f"{ts()} [{name}] 无劣化基准(rec=0) => 本轮只判 dead/slow, degraded 不参与", flush=True)
-        kind, label = classify(sp, rec)
+        kind, label = classify(sp, rec, floor=DEGRADE_MIN_RECORD.get(name, DEGRADE_MIN_RECORD_DEFAULT),
+                               untrusted=untrusted)
+        if kind == "unmeasured":
+            # 0 分不是"死", 也不该复测(复测还是 0, 只是多花 8s): 直接记账跳过, 不进 bad。
+            spd[name] = sp
+            print(f"{ts()} [{name}] {ip} steady={sp:.1f}MiB/s => {label}", flush=True)
+            continue
         if kind != "ok":
             # 单次 8s 采样在晚高峰会抖(实测 108 的节点偶发掉到 40): 复测一次取高值,
             # 两次都低才动手 —— 否则会把好节点换成更慢的热备, 典型的"越止越慢"
@@ -583,7 +771,7 @@ def main():
             if sp2 > sp:
                 print(f"{ts()} [{name}] 复测 {sp2:.1f}MiB/s (首测 {sp:.1f}MiB/s), 判据取高值", flush=True)
                 sp = sp2
-                kind, label = classify(sp, rec)
+                kind, label = classify(sp, rec, floor=DEGRADE_MIN_RECORD.get(name, DEGRADE_MIN_RECORD_DEFAULT))
         spd[name] = sp
         print(f"{ts()} [{name}] {ip} steady={sp:.1f}MiB/s => {label}", flush=True)
         if kind != "ok":
