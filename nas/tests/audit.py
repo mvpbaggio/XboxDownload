@@ -46,19 +46,42 @@ FAIL_CONSTS = (False, None, 0, 0.0, "")
 FAILURE_EXITS = {
     ("xbox-speedtest.py", "dl_speed"): 3,          # 非 200/206、异常、正常返回路径里的 0 值
     ("xbox-speedtest.py", "dl_steady"): 3,          # v2.3.19: IfExp 补数后 +1(0.0 if not got else ...)
-    ("xbox-speedtest.py", "mark_retest"): 1,        # v2.3.14: 标记写不进去不得影响测速
+    ("xbox-speedtest.py", "mark_retest"): 2,        # v2.3.14: 标记写不进去不得影响测速
+                                                    # v2.3.34: +1 = 读旧标记失败(旧格式/JSON 坏)时按空表继续 ——
+                                                    #   读不出旧格绝不能阻碍写本轮格, 否则冷却永久失效
     ("xbox-speedtest.py", "median_of"): 1,          # v2.3.19: `median(good) if good else 0.0`
-    ("watchdog.py", "retest_cooldown_left"): 3,     # v2.3.14: 无标记/读不出、未来时间戳、冷却已过
+    ("watchdog.py", "retest_cooldown_left"): 8,     # v2.3.14: 无标记/读不出、未来时间戳、冷却已过
+                                                    # v2.3.34 3 -> 8 (P2-D 按组读): 空文件、dict 里没这组、
+                                                    #   json 解析失败后回退裸数字、裸数字也解析失败 —— 四条新出口
+                                                    #   方向一致(读不出就当没冷却, 宁可多测一次)。它**不是**
+                                                    #   "越写越安全": 任何一条改成 return 大数都会把重测冻死,
+                                                    #   C48c(无标记)/C48d(未来时间戳)会在那两种上抓
     ("xbox-speedtest.py", "op_of"): 2,             # v2.3.5 新增: 空标签 / 域名型标签 -> 未知运营商
     ("xbox-speedtest.py", "test_pool"): 1,          # 全部候选无有效结果 -> None
-    ("xbox-speedtest.py", "decision_note"): 2,      # v2.3.10: 轮次不足/阈值无效、判定本来就稳 -> 不刷日志
+    ("xbox-speedtest.py", "decision_note"): 3,      # v2.3.10: 轮次不足/阈值无效、判定本来就稳 -> 不刷日志
+                                                    # v2.3.35 2 -> 3 (N3): 拆出"一轮都没出数"这一条 ——
+                                                    #   它跟"本来就稳"不是一件事(前者是没数据, 后者是数据太齐),
+                                                    #   合在一个 if 里正是极差吃 0 值的同一个毛病的邻居
     ("xbox-speedtest.py", "router_cmd"): 3,         # v2.3.19: `... if rc==0 else None` 这条也被数进来了
     ("xbox-speedtest.py", "router_apply"): 3,       # v2.3.5: no change / uci 失败 / restart 失败
-    ("xbox-speedtest.py", "main"): 4,               # 锁占用、路由器不可达、两组无结果分支
+    ("xbox-speedtest.py", "main"): 3,               # 锁占用、路由器不可达、两组无结果分支
+                                                    # v2.3.34 曾 +2 = results.json 读段的两个 except 处理器
+                                                    # v2.3.35 3 -> (回落到) 3: 那一段整块搬进 persist_results(),
+                                                    #   计数跟着函数走, 不是"少了两条失败路径" —— 别把回落
+                                                    #   当成变安全: 真正的失败处置现在在下面的 persist_results
+    ("xbox-speedtest.py", "persist_results"): 5,    # v2.3.35 (N1): 读不了的 FileNotFoundError(正常态)、
+                                                    #   读坏的 except、隔离失败、写盘失败。方向都是"不让故障
+                                                    #   自我维持": 前两个 -> 隔离并重建, 后两个 -> 说清留证据/重试
+                                                    # v2.3.36 4 -> 5 (M2): +1 = `.seen` 标记写不成(只让下一轮
+                                                    #   的 created 退化成有损, 不让整轮失败)。**这条是唯一一条
+                                                    #   "故意吞掉"的**, 所以必须在这里写清方向 —— 别把数字变大
+                                                    #   当成"越来越安全"
     ("watchdog.py", "router_cmd"): 3,               # v2.3.19: 同上, 三元 else None
     ("watchdog.py", "router_apply"): 2,             # uci 失败、restart 失败
     ("watchdog.py", "steady"): 3,
-    ("watchdog.py", "canary"): 2,                   # v2.3.28: 连不上 -> False, 非 2xx -> False
+    ("watchdog.py", "canary"): 1,                   # v2.3.28: 连不上/非 2xx 各一个出口
+                                                    # v2.3.34 2 -> 1 (P3-F): 删掉 return False, 判据只剩 state;
+                                                    #   剩的 1 是 except 分支那个裸 return(写完 failed 再返回)
     ("xbox-speedtest.py", "write_samples"): 1,      # v2.3.28: 落盘失败 -> 打 warn 并返回已写行数
     ("watchdog.py", "load_hotspares"): 1,           # results.json 读不出
     ("watchdog.py", "load_record"): 7,              # v2.3.5: 多一层 pinned_ip 匹配容错(原 6)
@@ -89,6 +112,7 @@ FAILURE_TESTS = {
     ("xbox-speedtest.py", "router_apply"): ["C29"],
     ("xbox-speedtest.py", "main"): ["C19", "C20", "C21", "C22", "C27"],
     ("xbox-speedtest.py", "mark_retest"): ["C49c"],
+    ("xbox-speedtest.py", "persist_results"): ["C86b"],
     ("xbox-speedtest.py", "median_of"): ["C63"],
     ("watchdog.py", "retest_cooldown_left"): ["C48c", "C48d"],
     ("watchdog.py", "router_cmd"): ["C9", "C10"],
@@ -1651,7 +1675,15 @@ def audit_behaviour(d):
 
     x49, _r49, _b49, _o49 = st_run([(90.0, "9.9.9.9")], {"9.9.9.9": 90.0}, {"9.9.9.9": 88.0})
     mp49 = os.path.join(x49.BASE, x49.RETEST_MARK_NAME)
-    age49 = (time.time() - int(open(mp49, encoding="utf-8").read().strip())) if os.path.exists(mp49) else 1e9
+    # v2.3.34 标记改成按组的 JSON {"Cn1": epoch}。这里必须跟着改: 直接 int(文本) 会在
+    # C0「段可执行」里炸成 ValueError, 而 C0 只会说"崩了", 不会说"读标记的口径过时了"。
+    def _age49(path):
+        raw = open(path, encoding="utf-8").read().strip()
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            obj = max(obj.values()) if obj else 0
+        return time.time() - float(obj)
+    age49 = _age49(mp49) if os.path.exists(mp49) else 1e9
     chk("C49b", "主程序每轮开头都打标记(全量 cron / 手动 / 看门狗触发都算一次重测)",
         0 <= age49 < 300, "标记 age=%.0fs 存在=%s" % (age49, os.path.exists(mp49)))
 
@@ -1686,9 +1718,9 @@ def audit_behaviour(d):
     def _pre51(m):
         orig51 = m.mark_retest
 
-        def _spy51():
+        def _spy51(*a, **k):
             seen51.append(os.path.exists(os.path.join(m.BASE, "results.json")))
-            orig51()
+            orig51(*a, **k)      # v2.3.34: mark_retest 带上组参数了, 桩必须跟着接(*a, **k)
         m.mark_retest = _spy51
 
     st_run([(90.0, "9.9.9.9")], {"9.9.9.9": 90.0}, {"9.9.9.9": 88.8}, pre=_pre51)
@@ -2295,31 +2327,42 @@ def audit_behaviour(d):
     # 真连接、把 subprocess 的 300s 超时跑穿(本地快只是碰巧, 那些 IP 拒得快)。
     # 审计必须离线跑: 桩要覆盖被测代码**所有**出门的路, 不能只覆盖主路径。
     w71.BindIPConn = _Conn71
+    # v2.3.34: canary 不再返回 bool(P3-F), 判定唯一的口是 state。所以这里查 state + 文案,
+    # 并顺带钉住"返回值为 None" —— 那个 bool 是 state 的有损副本, 留着就会有人拿它当判据。
+    _s71 = {}
     _Conn71.status, _Conn71.methods = 206, []
-    ok206, out206 = capture(w71.canary, "Cn2")
+    _st206 = {}
+    ok206, out206 = capture(w71.canary, "Cn2", _st206)
     _Conn71.status = 404
-    ok404, out404 = capture(w71.canary, "Cn2")
+    _st404 = {}
+    ok404, out404 = capture(w71.canary, "Cn2", _st404)
     _Conn71.status = 403
-    ok403, out403 = capture(w71.canary, "Cn2")
+    _st403 = {}
+    ok403, out403 = capture(w71.canary, "Cn2", _st403)
     _Conn71.status = 503
-    ok503, out503 = capture(w71.canary, "Cn2")
+    _st503 = {}
+    ok503, out503 = capture(w71.canary, "Cn2", _st503)
     _Conn71.status = -1
-    okerr, outerr = capture(w71.canary, "Cn2")
+    _stErr = {}
+    okerr, outerr = capture(w71.canary, "Cn2", _stErr)
     # 四档文案必须分开。2026-11-07 实测: 改之前 403/429/503 与 404 打的是**逐字相同**的
     # 一句话, 全叫人「去换 build」。403 多半只是这台出口被限流, 换了 build 明天照样 403 ——
     # 那不是漏报, 是指错方向, 比不报更费人。
-    chk("C71", "canary 五档: 206/200 静默 / 404 点名撤版 / 403·429 只说被拒(先别换 build) / "
-               "5xx 不下结论 / 连不上只说 HEAD 失败",
-        ok206 is True and out206.strip() == ""
-        and ok404 is False and "404" in out404 and "canary" in out404 and "同一个 URL" in out404
-        and ok403 is False and "别换" in out403 and "撤版" in out403 and "不存在" in out403
-        and ok503 is False and "文件不存在" in out503 and "撤版" not in out503
-        and okerr is False and "HEAD 失败" in outerr and "下架" not in outerr
+    chk("C71", "canary 五档写进 state 且文案分开: 206/200 => ok 静默 / 404 => gone 点名撤版 / "
+               "403·429 => denied 只说被拒(先别换 build) / 5xx => unknown 不下结论 / "
+               "连不上 => failed 只说 HEAD 失败; **且五种情况返回值都是 None**(bool 是 state 的有损副本)",
+        _st206.get("Cn2") == "ok" and out206.strip() == ""
+        and _st404.get("Cn2") == "gone" and "404" in out404 and "canary" in out404
+        and "同一个 URL" in out404
+        and _st403.get("Cn2") == "denied" and "别换" in out403 and "撤版" in out403 and "不存在" in out403
+        and _st503.get("Cn2") == "unknown" and "文件不存在" in out503 and "撤版" not in out503
+        and _stErr.get("Cn2") == "failed" and "HEAD 失败" in outerr and "下架" not in outerr
+        and all(x is None for x in (ok206, ok404, ok403, ok503, okerr))
         and set(_Conn71.methods) == {"HEAD"},
-        "206=%r/%r 404=%r/%r 403=%r/%r 503=%r/%r err=%r/%r methods=%s"
-        % (ok206, out206.strip()[:40], ok404, out404.strip()[:60],
-           ok403, out403.strip()[:50], ok503, out503.strip()[:50],
-           okerr, outerr.strip()[:60], sorted(set(_Conn71.methods))))
+        "state=%r/%r/%r/%r/%r 返回=%r/%r/%r/%r/%r methods=%s"
+        % (_st206.get("Cn2"), _st404.get("Cn2"), _st403.get("Cn2"),
+           _st503.get("Cn2"), _stErr.get("Cn2"),
+           ok206, ok404, ok403, ok503, okerr, sorted(set(_Conn71.methods))))
 
 
     # ---- C72 samples.jsonl 落盘: 两轮 append, 第二轮不能抹掉第一轮 ----
@@ -2484,6 +2527,7 @@ def audit_behaviour(d):
     # 前 3 名是"谁先进场"的产物, 与节点质量零关系。真机侧同一节点: 串行 28.9 / 4 路并发每路 21.3。
     # 这一列(dl_speed 进场时同批在跑几路)是唯一能把"同节点跨轮漂移"归因到"对手变了"的凭证 ——
     # 没有它, 改了排序也证明不了改对。**本轮只加观测, 不改排序**(方向见台账)。
+    # v2.3.35: 桩仍然这么写(它只是一个能同时压出 4 路的装置), 但**不再拿桩的形状当断言**。
     x77 = load(os.path.join(d, "xbox-speedtest.py"), "xst77")
     _lock77 = threading.Lock()
     _st77 = [0]
@@ -2503,13 +2547,23 @@ def audit_behaviour(d):
     _r77, _o77 = capture(x77._screen, [("10.0.0.%d" % i, "") for i in range(12)],
                          "h", "/p", budget=999.0, wave_out=_w77)
     _sp77 = [sp for sp, _ip in _r77]
-    # 分数必须差出几倍(同质节点却不同分 = 分摊在场), wave 必须落在 1..SCREEN_WORKERS 且到顶
-    _bowl = bool(_sp77) and max(_sp77) >= 3 * min(_sp77)
-    chk("C77", "粗筛并发分摊可观测: wave_out 每个测到的 IP 都有『进场时同批几路』, 上界=SCREEN_WORKERS; "
-               "12 个同质节点的分数差出倍数(说明分数是份额不是节点能力)",
+    _wv77 = list(_w77.values())
+    # v2.3.35 (审查方 N2): 这里原来还有一条 `_bowl = max(_sp77) >= 3 * min(_sp77)`, 验的是
+    # **桩自己的假设**(共享管道 -> 进场越晚分得越少)。而本轮 C83/C85 的立项理由恰恰是真机
+    # 证伪了这个模型: 2026-11-08 04:00 的 Cn1 有 41/48 个分数 > 20.0、最高单路 73.2, 出口没被
+    # 打满, 分数不是"抢到的样子"。同一次 run 里 C77 要求"4 路必须差 3 倍"、C85 要求"分数可以贴
+    # 80 且与并发无关", 两条对同一个物理量给出相反模型。桩返回什么排序就得表现什么 = 自己给自己
+    # 出题; 万一哪天真把 `_screen` 改成"进场顺序不影响带宽"(这正是真机行为), C77 会红 —— 而它红
+    # 的时候是对的。所以差倍数这一条移出: C77 只留**结构不变量**, 分数与并发的关系降到真样本观测
+    # (v2.3.36 更正: 原来这里写"逐 IP 的 wave 没入库", 是事实错误 —— screen_wave 一直是
+    # {ip: wave} 逐 IP 落盘的。算不出相关性是因为**单行内 wave 常无方差**, 要跨行攒档位;
+    # "没入库"与"要攒"方向相反, 前者会让"4 路分摊"永远不做。分档观测见 C93 与 replay 2c)。
+    chk("C77", "粗筛并发分摊可观测: wave_out 每个测到的 IP 都有『进场时同批几路』, 上界=SCREEN_WORKERS, "
+               "每路都在 1..上界(分数差几倍不判 —— 那是桩的假设, 不是被测代码的性质; 见 v2.3.35 N2)",
         sorted(_w77) == sorted(ip for _sp, ip in _r77)
-        and max(_w77.values()) == x77.SCREEN_WORKERS
-        and _bowl,
+        and max(_wv77) == x77.SCREEN_WORKERS
+        and min(_wv77) >= 1
+        and all(v <= x77.SCREEN_WORKERS for v in _wv77),
         "wave=%r scores=%r" % (_w77, [round(v, 1) for v in _sp77[:5]]))
 
     # ---- C78 粗筛三态: 没测到 / 测了 0 分 / 有分 ----
@@ -2615,38 +2669,48 @@ def audit_behaviour(d):
     # 于是 `screen_capped` 在现行档位下恒空 —— 而"空"有两种含义(这一档撞不到 / 真没人撞), 同形。
     # 这是 P1-B「缺席原因必须可辨」的第四遍, 前三遍钉在 quick_skip / l0_pool / screen_skip+zero 上。
     _smp82 = x78.build_sample("Cn1", 1.0, [], [(-10.0, "1.1.1.1")], {}, {},
-                              screen_wave={"1.1.1.1": 4, "2.2.2.2": 1}, screen_cap=80.0 / 4)
-    _smp82b = x78.build_sample("Cn1", 1.0, [], [], {}, {}, screen_wave={}, screen_cap=None)
+                              screen_wave={"1.1.1.1": 4, "2.2.2.2": 1},
+                              screen_floor=80.0, screen_need=320.0)
+    _smp82b = x78.build_sample("Cn1", 1.0, [], [], {}, {}, screen_wave={},
+                               screen_floor=None, screen_need=None)
     _ceil82 = getattr(x78, "SPEED_CEIL_MIB", -1)
-    chk("C82", "撞顶线是每路的: SPEED_CEIL_MIB=8MiB/0.1s=80, 样本 screen_cap 必须随 max(wave) 摊薄"
-               "(4 路=>20.0); 没量出 wave 时记 None, 让『没记』与『记了 0』可辨",
+    chk("C82", "两个量必须分开记: screen_floor=撞顶线本身(80.0, **与并发无关**) + "
+               "screen_need=达到它所需的出口总带宽(80×max(wave)=320.0); 没量出 wave 时都记 None",
         abs(_ceil82 - 80.0) < 1e-9
-        and _smp82.get("screen_cap") == 20.0
+        and _smp82.get("screen_floor") == 80.0
+        and _smp82.get("screen_need") == 320.0
         and _smp82.get("screen_wave") == {"1.1.1.1": 4, "2.2.2.2": 1}
-        and "screen_cap" in _smp82b and _smp82b.get("screen_cap") is None,
-        "SPEED_CEIL_MIB=%r cap=%r cap_no_wave=%r" % (_ceil82, _smp82.get("screen_cap"),
-                                                     _smp82b.get("screen_cap")))
+        and "screen_floor" in _smp82b and _smp82b.get("screen_floor") is None,
+        "SPEED_CEIL_MIB=%r floor=%r need=%r need_no_wave=%r"
+        % (_ceil82, _smp82.get("screen_floor"), _smp82.get("screen_need"),
+           _smp82b.get("screen_need")))
 
-    # ---- C83 常量定义与 capped 判据都必须是**每路**口径 ----
-    # 反面: 谁"顺手"把 SPEED_CEIL_MIB 除以 SCREEN_WORKERS 当成"节点上限", 那么在 4 路下
-    # 线变成 20MiB/s —— 而实测 P50 就是 21.6, 于是**一半以上节点被判撞顶**, capped 从"永远空"
-    # 翻成"永远满", 两种都是把观测变成噪声。同理 capped 判据若写成 `el < SPEED_MIN_EL * SCREEN_WORKERS`,
+    # ---- C83 常量定义**与消费点**都必须是每路口径 ----
+    # 反面: 谁"顺手"把 SPEED_CEIL_MIB 除以并发数当成"节点上限", 4 路下线变 20MiB/s, 于是
+    # 一半以上节点"被判撞顶"。capped 判据若写成 `el < SPEED_MIN_EL * SCREEN_WORKERS`,
     # 8MiB 在 0.4s 内读完也算撞顶。
+    # v2.3.34: 上一版只查**定义行**(`SPEED_CEIL_MIB = ...`), 而错误实际出在**消费点**
+    # (`_cap_line = SPEED_CEIL_MIB / _wave_max`) —— `_wave_max` 真机恒等于 SCREEN_WORKERS,
+    # 换个变量名就绕过了正则。断言盯住定义、漏掉消费, 是"同一论证写两遍漏一遍"的第五遍。
     _src83 = open(os.path.join(d, "xbox-speedtest.py"), encoding="utf-8").read()
     _m83 = re.search(r"^SPEED_CEIL_MIB\s*=\s*([^\n#]+)", _src83, re.M)
     _expr83 = (_m83.group(1).strip() if _m83 else "")
-    chk("C83", "SPEED_CEIL_MIB 是每路天花板(定义里不得出现 SCREEN_WORKERS), capped 判据是 "
-               "`el < SPEED_MIN_EL`(el 是这一路读完 8MiB 的秒数), 不是 ×并发数",
+    _m83b = re.search(r"^\s*_floor_line\s*=\s*([^\n#]+)", _src83, re.M)
+    _expr83b = (_m83b.group(1).strip() if _m83b else "")
+    chk("C83", "SPEED_CEIL_MIB 是每路天花板: **定义式**不得出现 SCREEN_WORKERS, "
+               "**消费点** `_floor_line` 只能是 SPEED_CEIL_MIB 本身(除以任何并发量都是把"
+               "『更难达到』记成『门槛下降』); capped 判据是 `el < SPEED_MIN_EL`, 不是 ×并发数",
         bool(_m83) and "SCREEN_WORKERS" not in _expr83
         and "SCREEN_CHUNK" in _expr83 and "SPEED_MIN_EL" in _expr83
         and abs(_ceil82 - 80.0) < 1e-9
+        and _expr83b == "SPEED_CEIL_MIB"
         and re.search(r'"capped":\s*el\s*<\s*SPEED_MIN_EL\b', _src83) is not None,
-        "定义=%r 值=%r" % (_expr83, _ceil82))
+        "定义=%r 值=%r 消费点=%r" % (_expr83, _ceil82, _expr83b))
 
-    # ---- C84 端到端: test_pool 真的把「本轮单路撞顶线」算进样本 ----
-    # C82 只证明 build_sample 收得下这个数; 生产路径上这个数由 test_pool 算 —— 若那里写死
-    # `_cap_line = SPEED_CEIL_MIB`(不看 wave), 样本会记 80.0, 于是"4 路撞不到"这层解释又没了,
-    # 而 C82 仍绿。两条必须都有, 否则断言只钉住了"能传", 没钉住"传的是对的"。
+    # ---- C84 端到端: test_pool 把「撞顶线」和「达到它所需的出口带宽」分开算进样本 ----
+    # C82 只证明 build_sample 收得下; 生产路径上这两个数由 test_pool 算 —— 若那里写成
+    # `_floor_line = SPEED_CEIL_MIB / _wave_max`(v2.3.33 的真实缺陷), 样本会记 20.0, 于是
+    # "分数超过自己的上限"又回来了, 而 C82 仍绿。两条必须都有。
     x84 = load(os.path.join(d, "xbox-speedtest.py"), "xst84")
     _p84 = os.path.join(tempfile.mkdtemp(), "p84.txt")
     with open(_p84, "w", encoding="utf-8") as f:
@@ -2663,12 +2727,374 @@ def audit_behaviour(d):
     _sink84 = []
     _r84, _o84 = capture(x84.test_pool, "Cn1", _p84, "h", "/u", None, _sink84)
     _smp84 = _sink84[-1] if _sink84 else {}
-    chk("C84", "test_pool 把单路撞顶线算进样本: 最大并存 4 路 => screen_cap=20.0, "
-               "且 capped 为空时打一行明说(否则 capped 空依旧无从解释)",
-        _smp84.get("screen_cap") == 20.0
-        and any("单路撞顶线只有 20.0MiB/s" in ln for ln in _o84.splitlines()),
-        "screen_cap=%r 相关行=%r" % (_smp84.get("screen_cap"),
-                                    [ln.strip() for ln in _o84.splitlines() if "撞顶" in ln][:2]))
+    chk("C84", "test_pool 分开算: screen_floor 恒 80.0(与 wave 无关) + screen_need=80×max(wave)=320.0; "
+               "日志用**实测最高单路×wave**反推出口下界, 与 need 一比就说清 capped 为什么空",
+        _smp84.get("screen_floor") == 80.0
+        and _smp84.get("screen_need") == 320.0
+        and any("需出口 ≥ 320MiB/s" in ln for ln in _o84.splitlines())
+        and any("出口至少 120" in ln for ln in _o84.splitlines()),
+        "floor=%r need=%r 相关行=%r"
+        % (_smp84.get("screen_floor"), _smp84.get("screen_need"),
+           [ln.strip() for ln in _o84.splitlines() if "撞顶" in ln][:2]))
+
+    # ---- C85 真样本不变式: 任何分数都不得超过 screen_floor ----
+    # 这是**定义蕴含**的, 不含任何"均分"假设: capped 判据是 el < SPEED_MIN_EL, 分数 = 8MiB/el,
+    # 所以 score > 80 在算术上不存在。2026-11-08 04:00 的真样本违反了这一条 —— Cn1 的 48 个分数里
+    # 41 个 > screen_cap(20.0), 而 screen_capped 是空的。那不是"数据坏了", 是 20.0 从来没当过撞顶线。
+    # 只判**新格式**(有 screen_floor 的行): v2.3.33 及更早的行只有 screen_cap, 按旧口径确实违反,
+    # 历史数据不改写, 但新样本必须满足 —— 否则下一个人会照旧读反。
+    def _scan85(path):
+        """扫一个 samples.jsonl: 返回 (新格式行数, 旧格式行数, 违反列表, 文件在否, 最高分, 最低分)。"""
+        if not os.path.isfile(path):
+            return 0, 0, [], False, 0.0, 0.0
+        _n = _no = 0
+        _bad = []
+        _mx = _mn = 0.0
+        for _ln in open(path, encoding="utf-8"):
+            _ln = _ln.strip()
+            if not _ln:
+                continue
+            try:
+                _r = json.loads(_ln)
+            except Exception:
+                continue
+            if not isinstance(_r, dict):
+                continue
+            if "screen_floor" not in _r:
+                if "screen_cap" in _r:
+                    _no += 1
+                continue
+            _fl = _r.get("screen_floor")
+            _sc = _r.get("screen") or []
+            if not _fl or not _sc:
+                continue
+            _n += 1
+            _row = [float(x[0]) for x in _sc]
+            _m = max(_row)
+            if _m > _fl + 1e-6:
+                _bad.append((_r.get("ts"), _r.get("group"), _m, _fl))
+            _mx = max(_mx, _m)
+            _mn = min(_row) if not _mn else min(_mn, min(_row))
+        return _n, _no, _bad, True, _mx, _mn
+
+    _sp85 = os.path.join(d, "samples.jsonl")
+    _n85, _n85old, _bad85, _has85, _mx85, _mn85 = _scan85(_sp85)
+    # v2.3.35 (审查方 N5): 无样本时 `_bad85 = []` -> `not _bad85` 恒真 -> 绿。本机(无
+    # samples.jsonl)就是空过, 只打出"新格式 0 行判定", 结论照样是绿的 —— 空集永远满足不变式。
+    # 先喂一个**必然违反**的合成样本, 证明这条判据本身会红, 再去判真样本: 绿必须来自"判据活着
+    # 且没抓到", 不能来自"没东西可判"。
+    _fx85 = os.path.join(tempfile.mkdtemp(prefix="smp85_"), "samples.jsonl")
+    with open(_fx85, "w", encoding="utf-8") as _fw85:
+        _fw85.write(json.dumps({"ts": "synthetic", "group": "Cn1", "screen_floor": 80.0,
+                                "screen": [[90.0, "1.1.1.1"], [20.0, "2.2.2.2"]]}) + "\n")
+        _fw85.write(json.dumps({"ts": "synthetic", "group": "Cn2", "screen_floor": 80.0,
+                                "screen": [[73.2, "3.3.3.3"]]}) + "\n")
+    _fn85, _fo85, _fb85, _fh85ok, _fmx85, _fmn85 = _scan85(_fx85)
+    _alive85 = (_fh85ok and _fn85 == 2 and len(_fb85) == 1
+                and _fb85[0][2] == 90.0 and _fmx85 == 90.0 and _fmn85 == 20.0)
+    chk("C85", "真样本不变式: 分数 <= screen_floor(定义蕴含: capped=el<0.1s, 分数=8MiB/el, "
+               ">80 算术上不存在; 违反即说明 floor 记错了, 与『均分』无关)。判据先用合成样本自证会红, "
+               "无真样本时才允许通过",
+        _alive85 and not _bad85,
+        "判据自检: 合成 2 行 -> 抓 %r (需恰好 1 条 90.0, 最高/最低 %.1f/%.1f); "
+        "真样本 %d 行(最高 %.1f 最低 %.1f) / 旧格式(screen_cap) %d 行不判 -> 违反 %r"
+        % ([b[2] for b in _fb85], _fmx85, _fmn85, _n85, _mx85, _mn85, _n85old, _bad85[:3]))
+    # 观测(不判定): 分数 vs 并发档位。
+    # v2.3.36 (审查方 M1): 原来这里写的是"逐 IP 的 wave 没入库, 相关性算不出来", 这是**事实错误** ——
+    # `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的, replay 也早就配对取出来了。
+    # 算不出相关系数只因为**单行内 wave 常无方差**(满编时 48 个 IP 全是 4), 必须跨行按档位攒。
+    # 所以这里按 wave 分档给中位数/极差: 档位一多, "同 IP 跨档位分数变不变"就能直接读出来 ——
+    # 那正是账上"4 路分摊"需要的观测, 而不是不可测量。
+    _bw = {}
+    if _n85:
+        for _ln in open(_sp85, encoding="utf-8"):
+            _ln = _ln.strip()
+            if not _ln:
+                continue
+            try:
+                _r = json.loads(_ln)
+            except Exception:
+                continue
+            if not isinstance(_r, dict) or "screen_floor" not in _r:
+                continue
+            _wv = _r.get("screen_wave") or {}
+            for _sp, _ip in (_r.get("screen") or []):
+                _w = _wv.get(_ip)
+                if isinstance(_w, int) and _w > 0:
+                    _bw.setdefault(_w, []).append(float(_sp))
+    if _n85 and _mn85 > 0:
+        print("  [obs] 真样本 %d 行: 单路分数 %.1f ~ %.1f (floor 80.0) —— 贴 80 说明出口没被打满"
+              % (_n85, _mn85, _mx85), flush=True)
+    if _bw:
+        _parts = []
+        for _w in sorted(_bw):
+            _v = sorted(_bw[_w])
+            _md = _v[len(_v) // 2] if len(_v) % 2 else (_v[len(_v) // 2 - 1] + _v[len(_v) // 2]) / 2.0
+            _parts.append("wave=%d n=%d 中位%.1f 极差%.1f~%.1f" % (_w, len(_v), _md, _v[0], _v[-1]))
+        print("  [obs] 分数 vs 并发档位(跨 %d 行累积): %s" % (_n85, " | ".join(_parts)), flush=True)
+        if len(_bw) == 1:
+            print("       只有 1 个档位 —— 不下结论(这就是『要攒』的意思: 档位一多才看得出同 IP 变不变)",
+                  flush=True)
+    elif _n85:
+        print("  [obs] %d 行新格式样本里没有 screen_wave 能与 screen 配对 —— 这一列先攒数据" % _n85,
+              flush=True)
+
+    # ---- C93 逐 IP 的 wave **确实**入库(replay 2c 的分档观测全靠它) ----
+    # v2.3.36 (审查方 M1): v2.3.35 在三处注释里写了"逐 IP 的 wave 没入库", 是事实错误, 而且方向
+    # 致命 —— "没入库" = 结构上永远不可能, 账上挂着的"4 路分摊"会被判成不可测量; 真相是数据一直
+    # 在(`screen_wave` = {ip: 进场时同批几路}), 缺的只是跨档位样本。这条把事实钉在三处:
+    #   ①build_sample 真的是按 ip 建 dict(不是只存一个 max) ②replay 有分档观测段
+    #   ③合成样本上 screen 的每个 IP 都能在 screen_wave 里配对(这正是 replay 的配对口径)
+    _s93 = open(os.path.join(d, "xbox-speedtest.py"), encoding="utf-8").read()
+    # replay.py 从**审计器同目录**读(与上面 C78 的 _rp78 同口径): 变异目录里没有 tests/
+    # (selftest 的 FILES 只复制顶层交付物), 写 `d/tests/replay.py` 会在基线就 FileNotFoundError ——
+    # 那是"自检自己坏了", 比漏网更难看出来。
+    _r93 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay.py"),
+                encoding="utf-8").read()
+    _fx93 = os.path.join(tempfile.mkdtemp(prefix="smp93_"), "samples.jsonl")
+    with open(_fx93, "w", encoding="utf-8") as _fw93:
+        _fw93.write(json.dumps({"ts": "synthetic", "group": "Cn1", "screen_floor": 80.0,
+                                "screen": [[73.2, "1.1.1.1"], [66.6, "2.2.2.2"]],
+                                "screen_wave": {"1.1.1.1": 4, "2.2.2.2": 3}}) + "\n")
+    _o93 = json.loads(open(_fx93, encoding="utf-8").readline())
+    _wv93 = _o93.get("screen_wave") or {}
+    _pair93 = all(_ip in _wv93 for _sp, _ip in _o93["screen"]) and len(_wv93) == 2
+    chk("C93", "逐 IP 的 wave 确实入库: build_sample 的 screen_wave 是 {ip: wave} 逐 IP 字典、"
+               "replay 有『分数 vs 并发档位』分档段、合成样本上 screen 的 IP 全能在 screen_wave "
+               "配对 —— 『没入库』这个说法不再成立(它会让 4 路分摊被判成不可测量)",
+        ('"screen_wave": dict(' in _s93)
+        and ("[obs] 分数 vs 并发档位" in _r93)
+        and _pair93,
+        "源码按 ip 建 dict=%r replay 分档段=%r 合成配对=%r(wave=%r)"
+        % ('"screen_wave": dict(' in _s93, "[obs] 分数 vs 并发档位" in _r93, _pair93, _wv93))
+
+    # ---- C94 同一秒两次隔离: 两份坏证据都要在 ----
+    # v2.3.36 (审查方 M3): `.corrupt-<int(ts)>` 只到秒, 同一秒内隔离两次会**覆盖前一份坏证据**。
+    # 概率极低(一轮 3405s), 但坏证据被悄悄覆盖这件事事后无法发现 —— 所以加序号。
+    x94 = load(os.path.join(d, "xbox-speedtest.py"), "xst94")
+    _d94 = tempfile.mkdtemp(prefix="res94_")
+    _p94 = os.path.join(_d94, "results-dup.json")
+    _s94 = [{"group": "Cn1", "ip": "9.9.9.9", "speed": 95.0}]
+    _k94 = ["Cn1", "Cn2"]
+    _ev94 = []
+    for _step in (1, 2):
+        with open(_p94, "w", encoding="utf-8") as _fw94:
+            _fw94.write("{坏%d" % _step)
+        x94.persist_results(_p94, _s94, _k94, ts=1700000010)
+        _ev94.append([f for f in os.listdir(_d94) if ".corrupt-1700000010" in f])
+    _bak94 = sorted(set(_ev94[0]) | set(_ev94[1]))
+    _txt94 = [open(os.path.join(_d94, f), encoding="utf-8").read() for f in _bak94]
+    chk("C94", "同一秒两次隔离: 两份证据都在(文件名带序号, 内容各是当次的坏字节), 不互相覆盖",
+        len(_bak94) == 2 and sorted(_txt94) == ["{坏1", "{坏2"],
+        "隔离文件=%r 内容=%r" % (_bak94, _txt94))
+
+    # ---- C86 results.json 合并: 三条静默丢一组的路全部堵住 ----
+    # 审查方 P1-B: C13 验读侧(损坏 -> 空表, 那是**对的**)、C22 验写侧(seed 是合法 Cn2),
+    # 两条各自全绿, 而**交叉点**没人测 —— 一次 `--pool Cn1` 定向重测就能把 Cn2 整条抹掉,
+    # 代价是 load_record 回到 0.0(劣化档永久关闭)与 load_hotspares 回到 [](止血没备胎), 且不吭声。
+    x86 = load(os.path.join(d, "xbox-speedtest.py"), "xst86")
+    _s86 = [{"group": "Cn1", "ip": "9.9.9.9", "speed": 95.0}]
+    _c86 = [("Cn1", ""), ("Cn2", "")]
+    _k86 = [p[0] for p in _c86]
+    _r86a, _ok86a = x86.merge_results(
+        [{"group": "Cn1", "ip": "1.1.1.1"}, {"group": "Cn2", "ip": "2.2.2.2"}], _s86, _k86)
+    _r86b, _ok86b = x86.merge_results({"group": "Cn2", "ip": "2.2.2.2"}, _s86, _k86)
+    _r86c, _ok86c = x86.merge_results("不是 list", _s86, _k86)
+    _r86d, _ok86d = x86.merge_results(
+        [{"group": "Cn2", "ip": "2.2.2.2"}, {"group": "Cn3", "ip": "3.3.3.3"}, "垃圾"], _s86, _k86)
+    _r86e, _ok86e = x86.merge_results([], _s86, _k86)
+    chk("C86", "results.json 合并: ①只测一组时另一组必须留着 ②顶层不是 list / 不是数组 -> readable=False"
+               "(调用方不得写回, 拿 [] 当'没有旧账'就是丢数据的那条路) ③POOLS 之外的组原地保留 "
+               "④表里的非 dict 元素跳过而不炸 ⑤首次部署(空表)正常合并",
+        [g.get("group") for g in _r86a] == ["Cn1", "Cn2"]
+        and _ok86a is True
+        and _ok86b is False and _r86b == []
+        and _ok86c is False
+        and [g.get("group") for g in _r86d] == ["Cn1", "Cn2", "Cn3"]
+        and [g.get("group") for g in _r86e] == ["Cn1"],
+        "①%r ②ok=%r ③%r ④%r ⑤%r"
+        % ([g.get("group") for g in _r86a], _ok86b,
+           [g.get("group") for g in _r86d], _ok86d,
+           [g.get("group") for g in _r86e]))
+
+    # ---- C86b 坏表**连跑两轮**: 第二轮必须自愈 ----
+    # v2.3.35 (审查方 N1): v2.3.34 的处置是"读不出 -> 这一轮不写回", 而全仓只有那一处写点 ——
+    # 于是坏文件永远不会被重写: load_record 恒 0.0(劣化档永久关闭)、load_hotspares 恒 [](没备胎),
+    # 且这个状态**自我维持**。C86 当时五条全绿, 恰恰因为它验的是"不覆盖", 而"不覆盖"正是成因。
+    # 所以这条必须连跑两轮: 第一轮隔离 + 重建, 第二轮走正常合并(还能吃回别的组) —— 只验第一轮,
+    # 验不出这条永久故障。
+    _tmp86 = tempfile.mkdtemp(prefix="res86_")
+    _p86 = os.path.join(_tmp86, "results.json")
+    _corrupt86 = '{坏 json'
+    with open(_p86, "w", encoding="utf-8") as _fw86:
+        _fw86.write(_corrupt86)
+    _m86a, _st86a = x86.persist_results(_p86, _s86, _k86, ts=1700000000)
+    try:
+        _after1 = json.load(open(_p86, encoding="utf-8"))
+    except Exception:
+        _after1 = None
+    _bak86 = sorted(f for f in os.listdir(_tmp86) if ".corrupt-" in f)
+    _bak86_txt = open(os.path.join(_tmp86, _bak86[0]), encoding="utf-8").read() if _bak86 else None
+    # 第二轮: 旧表已可读, 手工塞进 Cn2(模拟另一组上轮留下的结论), 本轮仍然只测 Cn1
+    _seed86 = [g for g in (_after1 or []) if isinstance(g, dict)]
+    _seed86.append({"group": "Cn2", "ip": "2.2.2.2", "speed": 66.0})
+    with open(_p86, "w", encoding="utf-8") as _fw86b:
+        json.dump(_seed86, _fw86b)
+    _m86b, _st86b = x86.persist_results(_p86, _s86, _k86, ts=1700000001)
+    try:
+        _after2 = json.load(open(_p86, encoding="utf-8"))
+    except Exception:
+        _after2 = None
+    # 首次部署(文件不存在)是正常态, 不能被当成"损坏"而报 rebuilt
+    _p86e = os.path.join(_tmp86, "results-fresh.json")
+    _m86c, _st86c = x86.persist_results(_p86e, _s86, _k86, ts=1700000002)
+    # ④ v2.3.36 (审查方 M2): created 不能用"文件不在"当判据 —— 上一轮 unrepaired 之后文件
+    # 也是不在的(坏表已被 os.replace 挪去隔离, 新文件又没写成), 两者完全同形。status 值本身
+    # 有损, 与 P3-F 的 canary bool 同病, 只是代价在日志。造这条链: ①写成功一次(留下 .seen)
+    # ②删掉 results.json(等价于"隔离挪走 + 没写成") ③再跑 -> 必须是 created_after_writefail。
+    _p86d = os.path.join(_tmp86, "results-wf.json")
+    x86.persist_results(_p86d, _s86, _k86, ts=1700000003)
+    _seen86 = os.path.isfile(_p86d + ".seen")
+    os.remove(_p86d)
+    _m86d, _st86d = x86.persist_results(_p86d, _s86, _k86, ts=1700000004)
+    chk("C86b", "results.json 坏表**连跑两轮**: ①第一轮 status=rebuilt、坏字节被隔离成 .corrupt-<ts>"
+                "(内容原样) 、文件已可读且只含本轮组 ②第二轮 status=ok 走正常合并并吃回别的组 "
+                "③首次部署(无文件)= created 而不是 rebuilt "
+                "④写过一次后文件不见了(上一轮写了没成功) = created_after_writefail, 不是 created",
+        _st86a == "rebuilt"
+        and bool(_bak86) and _bak86_txt == _corrupt86
+        and [g.get("group") for g in (_after1 or [])] == ["Cn1"]
+        and _st86b == "ok"
+        and sorted(g.get("group") for g in (_after2 or [])) == ["Cn1", "Cn2"]
+        and _st86c == "created" and os.path.isfile(_p86e)
+        and _seen86 and _st86d == "created_after_writefail" and os.path.isfile(_p86d + ".seen"),
+        "①st=%r bak=%r 内容一致=%r 文件=%r ②st=%r 组=%r ③st=%r ④seen=%r st=%r"
+        % (_st86a, _bak86, _bak86_txt == _corrupt86,
+           [g.get("group") for g in (_after1 or [])],
+           _st86b, [g.get("group") for g in (_after2 or [])], _st86c, _seen86, _st86d))
+
+    # ---- C91 候选截断排序: 三态不得压回同一个键 ----
+    # v2.3.35 (审查方 P2-5): `score.get(ip, 0.0)` 让"预算跳过没测到"与"测了 0 分"等价,
+    # 而两者物理含义相反(未知 vs 已知坏)。这里直接喂纯函数, 不比行为反推。
+    _score91 = {"a": 50.0, "b": 20.0}
+    _skip91 = {"d"}
+    _order91 = sorted(["c", "a", "d", "b"], key=lambda i: x86.cand_rank(i, _score91, _skip91))
+    _k91 = [x86.cand_rank(i, _score91, _skip91) for i in ("a", "d", "c")]
+    chk("C91", "候选排序三态: 有分按分降序 > 没测到(预算跳过, 未知) > 测了 0 / 不在粗筛表 —— "
+               "把 skip 与 zero 压回同一个键会让截断先扔掉'未知'节点",
+        _order91 == ["a", "b", "d", "c"]
+        and _k91[0][0] < _k91[1][0] < _k91[2][0],
+        "order=%r keys=%r" % (_order91, _k91))
+
+    # ---- C92 decision_note 的极差与中位数必须同口径 ----
+    # v2.3.35 (审查方 N3): `median_of` 去 0(0 = 这一轮没测出), 而 min/max 吃含 0 的 rs ——
+    # 0/45/47 会打出「受抖动支配(三轮 0.0~47.0 横跨阈值)」, 把"一轮没测出来"说成"抖动"。
+    # 这两件事处置相反: 抖动该等下一轮, 没测出该查网络/查节点。
+    x92 = load(os.path.join(d, "xbox-speedtest.py"), "xst92")
+    x92._STEADY_ROUNDS_MEM = {"1.1.1.1": [0.0, 45.0, 200.0], "2.2.2.2": [0.0, 0.0, 0.0],
+                              "3.3.3.3": [0.0, 40.0, 90.0]}
+    _n92a = x92.decision_note("1.1.1.1", 40.0)     # 出数轮 45/200 都过线 -> 稳健, 不能叫抖动
+    _n92b = x92.decision_note("2.2.2.2", 40.0)     # 一轮都没出数 -> 不出声(零值日志另说)
+    _n92c = x92.decision_note("3.3.3.3", 60.0)     # 出数轮 40~90 真横跨 -> 该叫抖动
+    chk("C92", "decision_note 极差口径 = 中位数口径(只用出数轮): 0/45/200 vs 阈值 40 应判稳健且"
+               "不出现'0.0~'; 全 0 不出声; 40/90 横跨阈值才叫受抖动支配",
+        "稳健" in _n92a and "0.0~" not in _n92a
+        and _n92b == ""
+        and "受抖动支配" in _n92c and "40.0~90.0" in _n92c,
+        "①%r ②%r ③%r" % (_n92a, _n92b, _n92c))
+
+    # ---- C87 两组同轮止血到同一节点: 跨组 warn 必须响 ----
+    # 审查方 P1-C: `quick_fix(...)` 的返回值被丢掉, 于是 `pins` 还停在 get_pins() 那一刻的值,
+    # 第二组算 other_pins 时看到的是第一组的**旧** IP。两组切到同一个节点, 而那条
+    # 「单节点故障会同时打掉两组」的 warn 一次都不会响 —— 它比的是"对方上一轮钉着谁"。
+    m87 = load(wd_p, "wd87")
+    m87.BASE = tempfile.mkdtemp()
+    m87.get_pins = lambda: {"Cn1": "1.1.1.1", "Cn2": "2.2.2.2"}
+    m87.steady = lambda ip, host=None, path=None: 99.0 if ip == "7.7.7.7" else 0.0   # 两组死, 备胎好
+    m87.load_hotspares = lambda n: [{"ip": "7.7.7.7", "steady": 99}]   # 两组备胎是同一个
+    m87.router_cmd = lambda cmd: ("" if "show" not in cmd else
+                                  "dhcp.@dnsmasq[0].address='/assets1.xboxlive.cn/1.1.1.1' "
+                                  "dhcp.@dnsmasq[0].address='/assets2.xboxlive.cn/2.2.2.2'")
+    m87.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: None)})()
+    _r87, _o87 = capture(m87.main)
+    _warn87 = [ln for ln in _o87.splitlines() if "同时是另一组的钉住 IP" in ln]
+    chk("C87", "两组同轮都止血到同一个热备: 必须打跨组 warn(单节点故障会同时打掉两组)。"
+               "这要求 quick_fix 的返回值被调用点接住 —— 否则 other_pins 比的是对方**旧** IP, 永远不响",
+        len(_warn87) >= 1 and _o87.count("止血成功 => 切 7.7.7.7") == 2,
+        "warn 条数=%d 切到 7.7.7.7 次数=%d\n%s"
+        % (len(_warn87), _o87.count("止血成功 => 切 7.7.7.7"), _o87[-400:]))
+
+    # ---- C88 冷却带组维度: 一组的重测不得压住另一组 ----
+    # 审查方 P2-D: 标记只有一个 epoch, 08:30 修了 Cn1, 09:00 Cn2 整组死, 09:30 只止血不重测, 最长压 3 小时。
+    m88 = load(wd_p, "wd88")
+    m88.BASE = tempfile.mkdtemp()
+    with open(os.path.join(m88.BASE, m88.RETEST_MARK_NAME), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"Cn1": int(time.time() - 60)}))     # 只压 Cn1
+    _left88a = m88.retest_cooldown_left("Cn1")
+    _left88b = m88.retest_cooldown_left("Cn2")
+    with open(os.path.join(m88.BASE, m88.RETEST_MARK_NAME), "w", encoding="utf-8") as f:
+        f.write("%d\n" % int(time.time() - 60))                 # 旧格式: 一格管全部
+    _left88c = m88.retest_cooldown_left("Cn2")
+    m88.get_pins = lambda: {"Cn1": "1.1.1.1", "Cn2": "2.2.2.2"}
+    m88.steady = lambda ip, host=None, path=None: 0.0
+    m88.load_hotspares = lambda n: []
+    m88.router_cmd = lambda cmd: ("" if "show" not in cmd else
+                                  "dhcp.@dnsmasq[0].address='/assets1.xboxlive.cn/1.1.1.1' "
+                                  "dhcp.@dnsmasq[0].address='/assets2.xboxlive.cn/2.2.2.2'")
+    _ran88 = []
+    m88.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: _ran88.append(a))})()
+    with open(os.path.join(m88.BASE, m88.RETEST_MARK_NAME), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"Cn1": int(time.time() - 60)}))     # 再写回"只压 Cn1"
+    _r88, _o88 = capture(m88.main)
+    _trig88 = [ln for ln in _o88.splitlines() if "[trigger]" in ln]
+    chk("C88", "重测冷却按组判: 标记只压 Cn1 时 Cn2 必须照常触发(Cn1 仍被压); "
+               "**旧格式(裸数字)仍对全部组生效** —— 格式升级瞬间宁可多压一轮, 也不能放过本该冷却的那次",
+        _left88a > 0 and _left88b == 0 and _left88c > 0
+        and any("--pool Cn2" in ln and "--pool Cn1" not in ln for ln in _trig88),
+        "Cn1剩=%r Cn2剩=%r 旧格式Cn2剩=%r trigger=%r"
+        % (_left88a, _left88b, _left88c, _trig88[:2]))
+
+    # ---- C89 分段耗时必须进样本(不能再只打给人看) ----
+    # 审查方 P2-E: `_t` 在落盘前被 pop, 样本只有 t_l0; 而 t_l0 写进每一行却从未被正文读过。
+    # 3405s 一轮, 事后算不出"哪一段在变慢"。
+    _smp89 = x78.build_sample("Cn1", 5.0, [], [], {}, {}, t_screen=7.0, t_quick=32.0)
+    _smp89b = x78.build_sample("Cn1", 5.0, [], [], {}, {}, )
+    chk("C89", "分段耗时进样本: t_screen / t_quick 与 t_l0 三段都在(只打日志的话, 30 天后回放算不出"
+               "哪一段在变慢); 没传时记 None, 与『记了 0』可辨",
+        _smp89.get("t_screen") == 7.0 and _smp89.get("t_quick") == 32.0
+        and _smp89.get("t_l0") == 5.0
+        and "t_screen" in _smp89b and _smp89b.get("t_screen") is None,
+        "t_l0=%r t_screen=%r t_quick=%r (无参时 t_screen=%r)"
+        % (_smp89.get("t_l0"), _smp89.get("t_screen"), _smp89.get("t_quick"),
+           _smp89b.get("t_screen")))
+
+    # ---- C90 canary 不得再有 bool 返回值(它是 state 的有损副本) ----
+    # 审查方 P3-F: `return False` 同时代表 gone / denied / unknown / failed 四件事。决策早已只走
+    # state, 于是这是个"看着像判据、实际会骗人"的死接口 —— 下一个人写 `if not canary(x):`
+    # 就把"404 撤版"和"本机断网"当成同一件事, 正是三档注释花力气防的错。
+    # 用 AST 而不是正则: 要确认**每一个** Return 都不带值, 而不是"某一行看起来没有 return True"。
+    _tree90 = ast.parse(open(wd_p, encoding="utf-8").read())
+    _fn90 = None
+    for _n90 in _tree90.body:
+        if isinstance(_n90, ast.FunctionDef) and _n90.name == "canary":
+            _fn90 = _n90
+            break
+    _vals90 = [ast.dump(r.value) for r in ast.walk(_fn90) if isinstance(r, ast.Return) and r.value is not None] \
+        if _fn90 else ["<无 canary 函数>"]
+    _call90 = [n for n in ast.walk(_tree90)
+               if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "canary"]
+    # "丢掉返回值"= 调用点作为一条独立语句(ast.Expr.value)。别的位置都是"当值用",
+    # 那就等于重新引入一个判据口 —— 正是这条要防的。用位置集合判, 不靠 attrs 猜测。
+    _bare90 = set()
+    for _n90b in ast.walk(_tree90):
+        if isinstance(_n90b, ast.Expr) and isinstance(_n90b.value, ast.Call) \
+                and getattr(_n90b.value.func, "id", "") == "canary":
+            _bare90.add(id(_n90b.value))
+    _used90 = [ast.dump(n)[:120] for n in _call90 if id(n) not in _bare90]
+    chk("C90", "canary 只写 state、不返回 bool(False 同时代表 gone/denied/unknown/failed, "
+               "决策只走 state; 留一个 bool 就是留一个会骗人的判据)",
+        _vals90 == [] and not _used90,
+        "带值的 return=%r 调用点被当值用=%r" % (_vals90, _used90))
 
 
 def _stub_wd(wd_p):

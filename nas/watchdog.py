@@ -1,17 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Xbox 加速看门狗 v2.3.33: 每小时体检两组钉住 IP (TCP 连通 + 稳态吞吐),
+Xbox 加速看门狗 v2.3.36: 每小时体检两组钉住 IP (TCP 连通 + 稳态吞吐),
 任一组死掉、吞吐 < 8MiB/s、或掉到记录值一半以下(degraded) =>
   1) 热备止血: 读 results.json 的 hotspares(NAS 上轮全量测速验证过的次优节点),
      逐个用热备自己的测速对实测 8s, 第一个达标的**整组域名一起** uci 切过去 (分钟级恢复, 不等全量重测)
      达标线: 死/极慢 >= 20MiB/s; 只是劣化则还要比当前实测再快 10%(否则越止越慢)
   2) 定向重测: 触发 xbox-speedtest.py --pool <坏组> (只重测坏组, 不再全池 3.2h)
      **带 3 小时冷却**(RETEST_COOLDOWN): 冷却期内只做第 1 步止血, 不重测。
-v2.3.33 (2026-11-08 第二十九轮 —— 本文件**一行未改**, 版本号只跟着主程序走):
-  - 主程序这轮加了「本轮单路撞顶线」(`SPEED_CEIL_MIB / max(screen_wave)` → 样本 `screen_cap`),
-    解释 `screen_capped` 为什么在 4 路并发下结构性恒空。纯观测字段, 与看门狗无关。
-  - 版本号必须跟 A6 对齐(两脚本版本号不一致会红), 所以同步到这里; 别把这条当成"改了看门狗"。
+v2.3.36 (2026-11-08 第三十三轮 —— 本文件**一行未改**, 版本号只跟着主程序走):
+  - 主程序这轮三条全是**观测/记账面**的账, 与本文件无关, 但有一条值得知道:
+    `persist_results()` 新增 `results.json.seen`(写成功才 touch), 用来区分
+    `created` 与 `created_after_writefail`。本文件**不读**它, `load_record`/`load_hotspares`
+    的读取口径一个未动 —— 只是那个目录里会多一个文件, 别把它当交付物。
+  - `.corrupt-<ts>` 隔离文件现在同名冲突时加序号(`-1`/`-2`), 且**永不自动清理**(坏字节的唯一
+    证据, 删不删由人定)。本文件从不碰它们。
+v2.3.35 (2026-11-08 第三十二轮 —— 本文件**一行未改**, 版本号只跟着主程序走):
+  - 主程序这轮修的是 results.json 的**自我维持故障**(坏一次 → 每轮都读到坏文件 → 永不重写),
+    把读/合并/隔离/写抽成 `persist_results()`: 坏表先隔离成 `results.json.corrupt-<ts>`,
+    再用本轮结果重建。对本文件的意义正是下面 `load_record` 那条注释里的"永久失效"场景 ——
+    从此它**最多失效一轮**, 而不是失效到人工发现为止。
+  - `load_record`/`load_hotspares` 的读取口径一个未动(仍然是"读不出就打一行日志 + 返回 0.0/[]"),
+    所以 A6 之外的断言本文件都不该动; 版本号对齐是 A6 的硬要求。
+v2.3.34 (2026-11-08 第三十一轮 —— 外部审查 P1-C / P2-D / P3-F, **本文件三处真改动**, 阈值一个未动):
+  - (P1-C) **同一轮两组都止血时, 跨组告警永不触发(实测 0 条)**。`quick_fix(...)` 的返回值被丢掉,
+    `pins` 还是本轮开头的值, 于是 Cn2 拿到 `other_pins={Cn1 的旧 IP}` —— 而 Cn1 那个 IP 此刻
+    已被换掉, 告警条件"切到了别人正在用的 IP"虽然成立却按旧值判, 两组各切各的互不知情。
+    现在 `_r = quick_fix(...)`; 成功就 `pins[name] = _r`。三行, 但少了它这条告警等于没写。
+    反证 M110: 把 `pins[name] = _r` 删掉 -> C87 红(实测 warn 条数 0)。
+  - (P2-D) **`.last_retest` 没有组维度, 一组的重测压住另一组最长 3 小时**。原来是单个 epoch,
+    `--pool Cn1` 一写, Cn2 也跟着进冷却 —— 而 Cn2 那次劣化正是最该立刻重测的。
+    现在标记是 JSON `{group: epoch}`, `mark_retest(groups)` 只动传进来的格；
+    `retest_cooldown_left(name=None)` 带组读, 不传 name 仍取全组最大值(旧调用点行为不变)。
+    **旧格式(裸数字)仍对全部组生效** —— 宁可多压一轮, 也不要在升级瞬间放过本该冷却的那次。
+    反证 M111: 冷却不分组 -> C88 红。
+  - (P3-F) **`canary()` 的 bool 返回删了**。它是 `state` 的有损副本, 而且没人读:
+    `return False` 同时代表 gone / denied / unknown / failed 四种完全不同的事,
+    谁拿它当判据都会指错方向。决策早已只走 `state` 字典, 这个返回值是死接口, 删比留更对。
+    反证 M113: 把它改回 `return ok` -> C90 红(该断言还查了没有调用点把返回值当值用)。
+  - 上一轮(v2.3.33)这里写着"本文件一行未改", 那一轮到这一轮之间**已不成立**, 故改写。
+  - 主程序同轮改动见 `xbox-speedtest.py` 版本头: `screen_cap` 拆成 `screen_floor`/`screen_need`、
+    `results.json` 读不出不写回、样本补 `t_screen`/`t_quick`。版本号必须跟 A6 对齐。
 v2.3.32 (2026-11-08 第二十八轮 —— 外部审查 P2-C, 阈值一个未动):
   - (P2-C) `[span]` 那行把主程序的 `RANGE_SPAN` 抄成**字面量** 160MiB。A23 只比 README ↔ 代码,
     不比**代码 ↔ 代码**, 于是主程序把跨度改成 140/180 时这行照旧念 160 —— 而它存在的全部意义
@@ -458,7 +487,7 @@ def canary(name, state=None):
               f"也可能是本机出网断了; 先看这条再怀疑别的", flush=True)
         if state is not None:
             state[name] = "failed"     # 连不上 ≠ 撤版: 这条**不许**触发闸门, 见 canary_gate
-        return False
+        return
     ok = st in (200, 206)
     if not ok:
         # 三档必须分开, 否则运维照着错的方向动手。2026-11-07 实测: 403/429/503 与 404 打出来的
@@ -485,7 +514,11 @@ def canary(name, state=None):
                   f"是不是同一个状态(5xx 偶发几次很正常)", flush=True)
     elif state is not None:
         state[name] = "ok"
-    return ok
+    # v2.3.34 (审查方 P3-F): **不再返回 bool**。原来 `return ok` / `return False` 是 state 的
+    # 有损副本 —— False 同时代表 gone / denied / unknown / failed 四件完全不同的事, 而决策
+    # 早已只走 `state`(canary_gate 汇总), 于是这个返回值变成了"看着像判据、实际会骗人"的死接口:
+    # 下一个人写 `if not canary(x):` 就等于把"404 撤版"和"本机断网"当成一件事 ——
+    # 正是上面那段三档注释花力气去防的错。删掉它, 让唯一的判断口只剩 state。
 
 
 def canary_gate(names=None):
@@ -653,18 +686,45 @@ def classify(sp, rec, floor=None, untrusted=False):
     return "ok", "ok"
 
 
-def retest_cooldown_left():
+def retest_cooldown_left(name=None):
     """距上次定向重测还差多少秒。0 = 可以重测(无标记/标记过期/标记不可读都当可以)。
 
     标记文件由 xbox-speedtest.py 开头写(epoch 秒), 本程序只读 —— 单写者, 不会两边各写一份口径。
     未来时间戳(时钟回拨/手工写错)按"没见过"处理, 否则一次误写能把重测冻到任意久。
+
+    v2.3.34 (审查方 P2-D): 标记**带组维度**了。原来只有一个 epoch, 于是
+    `--pool Cn1` 的一次定向重测会把 Cn2 的冷却一起重置 —— 08:30 修了 Cn1, 09:00 Cn2 整组死,
+    09:30 的看门狗只止血不重测 Cn2, 最长压 3 小时; 反向同样成立, 手工跑一次调试也会误伤另一组。
+    现在文件是 {"Cn1": epoch, "Cn2": epoch}; **兼容旧格式**(纯数字): 那种情况下无法归因到组,
+    对所有组生效 —— 宁可多压一轮, 也不要在格式升级的瞬间放过一次本该冷却的重测。
+    `name=None` 取所有组里最新的那个(保守), 保留给"只想问一句还有没有冷却"的调用方。
     """
     try:
         with open(os.path.join(BASE, RETEST_MARK_NAME), encoding="utf-8") as fh:
-            last = int((fh.read() or "0").strip() or 0)
+            raw = (fh.read() or "").strip()
     except Exception:
         return 0
-    dt = time.time() - last
+    if not raw:
+        return 0
+    last = None
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            if name is not None:
+                last = obj.get(name)
+            else:
+                vals = [v for v in obj.values() if isinstance(v, (int, float))]
+                last = max(vals) if vals else None
+        elif isinstance(obj, (int, float)):      # 旧格式: 单格 epoch, 对全部组生效
+            last = obj
+    except Exception:
+        try:                                      # 最旧格式: 一个裸十进制数
+            last = int(raw)
+        except Exception:
+            return 0
+    if last is None:
+        return 0
+    dt = time.time() - float(last)
     if dt < 0:
         return 0
     return max(0, int(RETEST_COOLDOWN - dt))
@@ -796,23 +856,39 @@ def main():
                     floor = HOTSPARE_MIN_MIBS
                     if spd.get(name, 0) >= THRESHOLD_MIBS:
                         floor = max(HOTSPARE_MIN_MIBS, spd[name] * 1.1)
-                    quick_fix(name, pins[name], floor,
-                              other_pins={v for k, v in pins.items() if k != name and v})
+                    # v2.3.34 (审查方 P1-C): 返回值必须接住。原来这里裸调, `pins` 还停在
+                    # get_pins() 那一刻的值, 于是第二组算 other_pins 时看到的是第一组的**旧** IP。
+                    # 后果: 两组同轮都止血到同一个节点, 而 `other_pins` 那条跨组 warn
+                    # (「单节点故障会同时打掉两组」)一次都不会响 —— 它比的是"对方上一轮钉着谁",
+                    # 不是"对方这一轮切到了哪"。切完就更新, warn 才有对象。
+                    _r = quick_fix(name, pins[name], floor,
+                                   other_pins={v for k, v in pins.items() if k != name and v})
+                    if _r:
+                        pins[name] = _r
         finally:
             if lk:
                 lk.close()      # 必须先放锁再拉子进程: 子进程自己要拿同一把锁
         # 第二步: 定向重测坏组(speedtest 会读到止血后的新钉住 IP, 迟滞保护不会立刻换走)
         # 冷却只挡第二步: 止血是分钟级、几 MB 的事, 任何情况下都照做; 被挡的是每次 3.71GiB 的重测。
-        left = retest_cooldown_left()
-        if left > 0:
-            print(f"{ts()} [cooldown] 上次重测在 {RETEST_COOLDOWN - left}s 前, 冷却剩 {left}s => 只止血, 本轮不重测",
-                  flush=True)
-        else:
-            groups = list(dict.fromkeys(bad))
+        # v2.3.34 (审查方 P2-D): 冷却**按组**判。原来整轮共用一个 epoch, 一组被重测就把另一组
+        # 一起压住 3 小时 —— 而"哪一组该重测"与"上一次重测的是哪一组"本是两件事。
+        groups = list(dict.fromkeys(bad))
+        _fire = []
+        for g in groups:
+            _left = retest_cooldown_left(g)
+            if _left > 0:
+                print(f"{ts()} [cooldown] {g} 上次重测在 {RETEST_COOLDOWN - _left}s 前, "
+                      f"冷却剩 {_left}s => 该组只止血, 本轮不重测", flush=True)
+            else:
+                _fire.append(g)
+        if _fire:
             args = []
-            for g in groups:
+            for g in _fire:
                 args += ["--pool", g]
-            print(f"{ts()} [trigger] 异常组 {groups} => 触发定向重测 {' '.join(args)}", flush=True)
+            print(f"{ts()} [trigger] 需重测的组 {_fire}"
+                  + (f" (冷却中未触发: {[g for g in groups if g not in _fire]})"
+                     if len(_fire) < len(groups) else "")
+                  + f" => 触发定向重测 {' '.join(args)}", flush=True)
             # 只看 [trigger] 分不出"重测跑完了"与"子进程被 OOM/异常杀掉": 旧实现既不设 timeout 也不看
             # 退出码(2026-11-07 外部审计 B3-②)。一次实测最长 3405s, 取 5400s 作上限: 超了就是卡死,
             # 让本进程收手并留下证据, 而不是挂着 .watchdog.lock 把下一小时的体检也一起堵死。

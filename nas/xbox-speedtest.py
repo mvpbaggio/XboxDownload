@@ -2,6 +2,111 @@
 # -*- coding: utf-8 -*-
 r"""
 Xbox 加速 - NAS 定时自动测速找最快节点并更新路由器 (ZOS/Python3.8 兼容)
+v2.3.36 (2026-11-08 第三十三轮 —— 三条**都是我自己写出来的**, 其中 M1 是措辞错到会让两周后的
+          观测直接放弃的那一类; 阈值/并发/排序口径一个未动, 唯一动到的行为是 status 值):
+  - (M1, 措辞, 后果最重) 三处写着"逐 IP 的 wave **没入库**, 相关性算不出来" —— **事实错误**。
+    `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的(build_sample), replay 143 行也
+    早就把它和 `screen` 配对取出来了, 只是只拿了 max 去算出口下界。真正算不出的原因是
+    **单行内 wave 常无方差**(满编时 48 个 IP 全是 4), 必须跨行/跨档位攒。两句话方向相反:
+    "没入库" = 结构上永远不可能 → 账上挂着的"4 路分摊"会被判成不可测量; "要先攒档位" = 这两周
+    正好在收。修: 三处措辞改正; replay 新增 **2c 分数 vs 并发档位**(按 wave 分档打中位数/极差,
+    并对出现在 >=2 个档位的 IP 做同 IP 对照 —— 档位一多就能直接读"同节点跨档位变不变");
+    audit 的 [obs] 段同样分档; 新增 **C93** 把事实钉住(build_sample 真按 ip 建 dict + replay 有
+    分档段 + 合成样本上 screen 的 IP 全能在 screen_wave 配对)。
+  - (M2, status 有损) `created` 原来只表示"文件不在", 而**上一轮写了没成功**(unrepaired: 坏表
+    已被隔离挪走、新文件没写成)之后文件也是不在的, 两者完全同形。与刚修完的 P3-F(canary 的
+    bool 同时表示四件事)是同一个病, 只是这一处代价在日志、不动决策。修: 写成功后 touch
+    `results.json.seen`, FileNotFoundError 时据此分 `created` / `created_after_writefail`;
+    C86b 补第 ④ 条(写过一次 → 删文件 → 必须是 created_after_writefail 而不是 created)。
+  - (M3, 证据覆盖) `.corrupt-<int(ts)>` 只到秒, 同一秒内隔离两次会**覆盖前一份坏证据**。概率
+    极低(一轮 3405s), 但"坏证据被悄悄覆盖"事后无法发现。修: 文件名加序号; 新增 C94(同秒两次
+    隔离 → 两份都在、内容各是当次的坏字节)。**隔离文件永不清理**这条按审查方判断留作观察项:
+    它是坏字节的唯一证据, 自动清理会引入"证据能自己消失"的新问题, 什么时候删由人定(已写进
+    persist_results 的 docstring)。
+  - 记账: `persist_results` 出口 4 → 5(`.seen` 标记写不成 → 只让下一轮的 created 退化成有损,
+    不让整轮失败 —— 这是全函数唯一一条**故意吞掉**的, 所以必须写清方向)。断言 166 → **168**
+    (C93/C94), 变异 116 → **119**(M117 只存 max / M118 status 同形 / M119 同秒覆盖)。
+
+v2.3.35 (2026-11-08 第三十二轮 —— 六条新发现**五条属实**, 其中 **N1 是 v2.3.34 我自己引入的回退**;
+          另修 P2-5 三态排序; P3-7 只记观察; P1-1/P1-4 按约定仍未动):
+  - (N1, 回退, 最重) results.json **坏一次 = 永久无法恢复**。v2.3.34 我为了"不丢组"改成
+    "读不出来这一轮就不写", 而全仓只有那一处写点 —— 于是坏文件永远不会被重写:
+    `load_record` 恒 0.0(劣化档永久关闭)、`load_hotspares` 恒 [](止血没备胎), 两件事各只打
+    一行日志, 且**自我维持**。链条和 A25/M84/M92 同族: C86 当时五条全绿, 恰恰因为验的是
+    "不覆盖", 而"不覆盖"正是这条永久故障的成因。修: 读/合并/隔离/写抽成 `persist_results()`,
+    坏表先 `os.replace` 成 `results.json.corrupt-<ts>` 再**用本轮结果重建**(代价: 旧账丢一次,
+    隔离文件里还在; 收益: 下一轮一定读得出来); 隔离失败也照样重写并说清"证据没留住"。
+    C86 补"坏表跑两轮, 第二轮必须自愈"—— 只验第一轮不覆盖, 验不出这条。
+  - (N2) C77 里的 `_bowl`(12 个同质节点分数差 3 倍)验的是**桩自己的假设**(共享管道 → 进场越晚
+    分得越少), 与本轮 C83/C85 的立项理由(真机 41/48 个分数 > 20、最高单路 73.2 ⇒ 出口没被打满,
+    分数不是"抢到的样子")相反。桩返回什么, 排序就得跟着表现什么 —— 自己给自己出题。
+    修: `_bowl` 移出 C77, C77 只留结构不变量(wave 键集 = 测到的 IP、上界 = SCREEN_WORKERS、
+    每路都在 1..上界); "分数与并发的关系"降到真样本上的观测行。
+    **v2.3.36 (审查方 M1) 更正**: 上一版这里写的是"逐 IP 的 wave 没有入库", 那是**事实错误** ——
+    `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的(build_sample), replay 也早就把它
+    和 `screen` 配对取出来了。真正算不出相关性的原因是**单行内 wave 常无方差**(满编时 48 个 IP
+    的 wave 全是 4), 必须跨行/跨档位攒。两句话的方向相反: "没入库" = 结构上永远不可能, 于是
+    "4 路分摊"这颗挂账会被判成不可测量; "要先攒档位" = 这两周正好在收。现在 replay 按 wave
+    分档打分数中位数/极差(见 2c), 档位一多就能直接读出"同 IP 跨档位分数变不变"。
+    (算不出来还写成断言, 就是下一条 N5 那个毛病 —— 但不写 ≠ 写"永远算不出来"。)
+  - (N3) `decision_note` 的极差与中位数**口径不一**: `median_of` 去 0(0 = 这一轮没测出),
+    `min/max` 吃含 0 的 rs —— 0/45/47 会打出「受抖动支配(三轮 0.0~47.0 横跨阈值)」,
+    把"一轮没测出来"说成"抖动", 而这两件事处置相反(抖动等下一轮, 没测出查网络)。
+    修: 极差只用出数轮, 文案改成「出数轮 x~y」并把"仅 n/m 轮出数(其余轮 0=没测出)"写进标签。
+  - (N4) `_t` 是死字段: 分段耗时进样本后, `test_pool` 返回值里的 `_t` 与 main 里那句
+    `r.pop("_t", None)` 都没有读者, 唯一效果是让下一个人以为 results.json 曾带分段耗时。
+    修: 两处一起删(没字段就不需要 pop), docstring 那句一并改写。
+  - (N5) C85 在**无样本时空过**: `_n85 = 0` → `_bad85 = []` → `not _bad85` 为真 → 绿。
+    本机(无 samples.jsonl)就是空过, 只打出"新格式 0 行判定"。同族于空集永远满足不变式。
+    修: 先喂一个**必然违反**的合成样本证明这条判据能红, 再去判真样本; 无真样本时如实说
+    "真样本 0 行, 判据已用合成样本验证过" —— 绿是因为判据活着, 不是因为没东西可判。
+  - (P2-5) `cands.sort(key=score.get(i, 0.0))`: score 里只有 sp>0, 于是"预算跳过没测到"与
+    "测了 0 分"在排序里等价。两者物理含义相反(未知 vs 已知坏)。修: 排序键改成
+    `有分 > 没测到 > 测了 0`, **这是本轮唯一动到排序的地方**, 影响面仅限"同为 0 分的候选之间
+    谁先被 MAX_QUICK_CANDS 截掉", 冠军判定/阈值/并发一个未动。
+  - (P3-7) 观察项, **未修**: `_STEADY_ROUNDS_MEM[ip]` 没有组维度。Cn1/Cn2 的 IP 段不重叠,
+    跨组误读要同一 IP 同时出现在两组的稳态缓存里, 现实概率低; 真出现时 `decision_note` 只会
+    把另一组的轮次算进"抖动", 不改判定方向。留着, 记在这里。
+  - **未动(按约定)**: `STEADY_MAX_BYTES = 256MiB`、`QUICK_ROUNDS = 2` —— "阈值/测量口径不动"。
+v2.3.34 (2026-11-08 第三十一轮 —— 一条**我自己上一轮写进去的实错** + 审查方六条, 逐条实测全属实;
+          **阈值/并发/排序口径一个未动, 改动全在观测与记账面, 另有两处真 bug 修复**):
+  - (实错, 自证) `screen_cap = SPEED_CEIL_MIB / max(wave)` 是错的换算。80 是**每路**的撞顶线
+    (8MiB/0.1s), 与并发无关; 并发只决定"够不够得着"——4 路满编要有一路跑到 80, 出口得有 320MiB/s。
+    除以 wave 得到的是"出口被均分时每路分到多少", 只有当出口被打满时才等于观察值。
+    **真机自证**(2026-11-08 04:00, Cn1): 48 个分数里 **41 个 > 20.0**, 而 `screen_capped` 是空的 ——
+    一个分数不可能超过自己的撞顶线, 所以 20.0 从来没当过那条线。上一轮我亲手写下的警告原文是
+    「线变 20, 而实测 P50 就是 21.6, 于是一半以上节点被判撞顶」, 数字一模一样, 只是没对上自己那行。
+    修: 拆成 `screen_floor`(恒 80.0) + `screen_need`(80×max(wave), 达到它所需出口),
+    日志改用**实测最高单路 × wave** 反推出口下界与 need 比 —— 不含任何"均分"假设。
+    **故意不记 80/wave**: 那个数恒等于常量除以常量, 不含观测信息, 且它正是这次误读的来源。
+    C83 从"只查定义行"扩到"定义 + 消费点"(上一轮的漏网处), 新增 C85 用**定义蕴含的不变式**
+    (`分数 <= floor`, 因为 capped 判据 el<0.1s 让 >80 算术上不存在) 在真样本上验。
+  - (P1-B) `results.json` 合并有三条**静默丢一整组**的路: ①`json.load` 抛异常 ②顶层不是 list
+    ③该组不在 `POOLS` 里(手工 `--pool Cn1` 就够, 不需要任何异常) —— 三条都落到 `existing = []`,
+    再按 `POOLS` 过滤写回。代价不是"少一行日志": `load_record` 回到 0.0(劣化档永久关闭)、
+    `load_hotspares` 回到 [](止血连备胎都没有), 而两件事都不吭声。C13 验读侧、C22 验写侧,
+    两条各自全绿而**交叉点**没人测。修: 抽出纯函数 `merge_results()`, 读不出返回 `readable=False`
+    让调用方**本轮不写回**; `POOLS` 之外的组原地保留; 新增 C86 直接喂五种坏输入。
+  - (P1-C) `quick_fix()` 的返回值被调用点丢掉, 于是 `pins` 停在 `get_pins()` 那一刻的值 ——
+    第二组算 `other_pins` 时看到的是第一组的**旧** IP。后果: 两组同轮都止血到同一节点, 而那条
+    「单节点故障会同时打掉两组」的 warn 一次都不会响(它比的是"对方上一轮钉着谁")。修: 接住返回值
+    并回写 `pins[name]`; 新增 C87 断言"两组同轮切到同一 IP 必须告警"。
+  - (P2-D) `.last_retest` 没有组维度: `--pool Cn1` 的一次定向重测会把 Cn2 的冷却一起重置
+    (08:30 修 Cn1, 09:00 Cn2 整组死, 09:30 只止血不重测, 最长压 3 小时; 反向同样成立,
+    手工跑一次调试也会误伤)。修: 标记改 `{"Cn1": epoch, "Cn2": epoch}`, 写入时**只动本轮测的组**
+    (整体覆盖会把另一组的标记抹掉 -> 冷却清零 -> 反而更容易触发一次 3.71GiB, 与冷却初衷相反);
+    读侧按组判, **旧格式(裸数字)仍对全部组生效**(格式升级瞬间宁可多压一轮)。新增 C88。
+  - (P2-E) 分段耗时只打给人看: `_t` 在落盘前被 `pop` 掉, 样本只有 `t_l0`, 而 `t_l0` 写进每一行
+    却从没被正文读过(存在只是为了过 WANTED 检查)。3405s 一轮, 事后算不出"哪一段在变慢"。
+    修: `t_screen`/`t_quick` 进样本, `replay` 出一段三段 P50/P90; 新增 C89。
+  - (P3-F) `canary()` 的 bool 返回值是 `state` 的**有损副本**: `False` 同时代表
+    gone / denied / unknown / failed 四件完全不同的事。决策早已只走 `state`, 于是它是个
+    "看着像判据、实际会骗人"的死接口 —— 下一个人写 `if not canary(x):` 就等于把"404 撤版"
+    和"本机断网"当成一件事, 正是三档注释花力气去防的错。修: **删掉返回值**, 判据唯一的口只剩
+    `state`; 新增 C90 用 AST 确认每个 `return` 都不带值、且没有调用点把结果当值用。
+  - (交付卫生) `.bak-v2325` 的删除条件「2026-11-08 04:00 那次无人值守全量跑完之后」已于 04:03
+    满足(run.log 末行 04:03:16, samples 追加 2 行 = 跑完), 本轮删除并改回滚点名为 `.bak-v2333`,
+    IGN 同步 —— 下个 `.bak-*` 来时照方抓药。
 v2.3.33 (2026-11-08 第二十九轮 —— 审查方把上一轮自己的结论翻案了; **阈值/并发/排序一个未动**):
   - (翻案) 上一轮它报「8MiB 撞顶在本出口 0/6, 不发生」。本轮它把并发降到 1 再测: 67 / 80.0 / 80.0 / 69
     —— 一半撞顶。两个观测都对, 差在档位: `SCREEN_WORKERS=4` 把每路压到 ~21MiB/s, 永远碰不到 80 的
@@ -459,14 +564,16 @@ SPEED_MIN_EL = 0.1            # 速率分母的地板(秒)。8MiB / 0.1s = **80M
                               #   实测 [(80.0,'8.8.8.8'),(80.0,'116.110.9.9'),(80.0,'1.1.1.1')] 降序,
                               #   也就是说「谁是冠军」曾由 IP 的字典序决定。
 SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / SPEED_MIN_EL   # 80.0
-                              # **每路**的撞顶线, 不是节点的。这条区别是 v2.3.33 的核心:
-                              # 8MiB/0.1s=80 说的是「这一路在 0.1s 内读完了 8MiB」。SCREEN_WORKERS=4
-                              # 时每路只分到总带宽的 1/4, 要撞 80 得先有 320MiB/s 总带宽 —— NAS 真机
-                              # 3 条样本 143 个粗筛分数: P50 21.6 / P90 35.7 / **max 62.7**, 到 80 的 0 个。
-                              # 也就是说 `screen_capped` 在现行档位下**结构性恒空**, 而"空"有两种含义:
-                              # 「这一档撞不到」(必然) 与「真没人撞」(可能) —— 同形。这是 P1-B
-                              # 「缺席原因必须可辨」的第四遍, 这次钉在 capped 上, 由 screen_cap 分开。
-                              # 反面: 谁"顺手"把它除以 SCREEN_WORKERS 当成节点上限, capped 就永不触发。
+                              # **每路**的撞顶线, 不是节点的: 8MiB/0.1s=80 说的是「这一路在 0.1s 内
+                              # 读完 8MiB」。它**与并发无关** —— 并发不改变这条线, 只决定够不够得着:
+                              # 4 路满编时要有一路跑到 80, 出口总带宽得有 80×4 = 320MiB/s。
+                              # 所以 `screen_capped` 在现行出口下结构性恒空, 而"空"有两种含义
+                              # (这一档撞不到 / 真没人撞) 同形 —— P1-B「缺席原因必须可辨」的第四遍。
+                              # v2.3.34 分开记: screen_floor=80(这条线本身) + screen_need=80×wave(够到它
+                              # 所需出口)。**不要再除以 wave**: 那算出的是"出口被均分时每路分到多少",
+                              # 只有出口打满时才等于观察值, 而当它被当成"撞顶线"时会造成自相矛盾 ——
+                              # 2026-11-08 04:00 真机 Cn1: 48 个分数里 41 个 > 80/4=20, 而 capped 是空的。
+                              # 反面由 C83(定义+消费点)、C84(生产路径)、C85(分数<=floor 的不变式) 三道钉住。
 QUICK_CHUNK = 80 * 1024 * 1024
 QUICK_MAX_SEC = 25.0          # 快测/粗筛墙钟上限: 防龟速节点把 80MB 拖成无限长(网络劣化时触发重测正需要它)
 STEADY_MAX_SEC = 8.0          # 稳态下载最长 8s
@@ -618,7 +725,152 @@ RETEST_MARK_NAME = ".last_retest"   # 与 watchdog.RETEST_MARK_NAME 必须同名
                                     # 路径在调用时用 BASE 拼: 模块导入时算死的话, 测试改 BASE 就重定向不动
 
 
-def mark_retest():
+def merge_results(existing, summary, known):
+    """把本轮 summary 合并进旧结果表, 返回 (merged, readable)。
+
+    v2.3.34 (审查方 P1-B): 抽成纯函数是为了让审计能直接喂坏输入 —— 原实现埋在 main 里,
+    C13 验读侧、C22 验写侧, 两条各自全绿而**交叉点**没人测, 于是三条静默丢一组的路都活着:
+      ①json.load 抛异常  ②顶层不是 list  ③该组不在 POOLS 里(手工 `--pool Cn1` 就够)
+    代价不是"少一行日志": load_record 回到 0.0 -> 劣化档永久关闭; load_hotspares 回到 [] ->
+    止血没有备胎; 两件事都不吭声。
+
+    `readable=False` 表示旧表读不出来, 调用方**不能直接拿 [] 当"没有旧账"写回** —— 那会把
+    另一组的记录一起抹掉。正确处置见 `persist_results()`(先隔离坏表再重建)。
+    `known` 之外的组原地保留(可能是临时注释掉某组后的存留, 不该被顺手删)。
+    """
+    if not isinstance(existing, list):
+        return [], False
+    by_group = {}
+    for g in existing:
+        if isinstance(g, dict) and g.get("group"):
+            by_group[g["group"]] = g
+    for g in summary:
+        by_group[g["group"]] = g
+    merged = [by_group[k] for k in known if k in by_group]
+    merged += [g for g in by_group.values() if g.get("group") not in known]
+    return merged, True
+
+
+def persist_results(out_path, summary, known, ts=None):
+    """读旧账 -> 合并 -> (坏表先隔离) -> 原子写。返回 (merged, status)。
+
+    v2.3.35 (审查方 N1, 这是 v2.3.34 我自己引入的**回退**): 上一版写的是"读不出来这一轮就不写",
+    理由是别拿空表抹掉另一组。这条推理对了一半, 代价是把一次**可恢复的丢组**换成了
+    **自我维持的永久故障**: 文件坏一次 -> 本轮不写 -> 下一轮读到同一个坏文件 -> 仍不写;
+    全仓没有第二个写点, 于是
+      `load_record` 恒 0.0 -> `rec >= DEGRADE_MIN_RECORD` 恒假 -> 劣化档永久关闭
+      `load_hotspares` 恒 []  -> 止血连备胎都没有
+    而这两件事各只打一行日志, 且它无人值守。C86 当时五条全过, 恰恰因为它验的就是"不覆盖" ——
+    "不覆盖"正是这条永久故障的成因(元系统静默失效, 与 A25/M84/M92 同族)。
+
+    现在: 坏表先 `os.replace` 成 `results.json.corrupt-<ts>`(证据留住, 也顺手把那个坏文件
+    从读路径上挪走), 再用本轮 summary 重建。代价是旧账丢一次(隔离文件里仍在), 换来的是
+    **下一轮一定读得出来** —— 故障不再自我维持。
+
+    status 六种, 只给人和审计看, 决策不读:
+      "ok"                    旧账正常, 按组合并(另一组的记录/顺序都保留)
+      "created"               首次部署没有旧账(FileNotFoundError 是正常态, 与"损坏"必须分开)
+      "created_after_writefail"
+                              文件也不在, 但**之前写成功过** —— 上一轮 unrepaired(坏表被隔离
+                              挪走、新文件没写成)就是这个形状。与"首次部署"必须区分开:
+                              v2.3.36 (审查方 M2) 之前两者同形, status 值本身有损, 与
+                              刚修完的 P3-F(canary 的 bool 同时表示四件事) 是同一个病,
+                              只是这一处的代价只在日志、不动决策。
+      "rebuilt"               旧表读不出来 -> 已隔离 + 用本轮结果重建
+      "rebuilt_noquarantine"  同上, 但隔离这一步失败(已直接覆盖重写; 坏字节没留证据)
+      "unrepaired"            写盘也失败 -> 本轮结论只留在 speed.log, 下一轮再试
+
+    区分 created / created_after_writefail 靠 `<out_path>.seen`: 任何一次**写成功**后 touch
+    它(内容只是时间戳, 给人看"上次写成功是什么时候")。标记写不成不影响结论, 只是下一轮的
+    created 退化成有损 —— 不值得为它让整轮失败。
+
+    观察项(v2.3.36 M3): `.corrupt-<ts>` 隔离文件**永不清理**, NAS 上会慢慢堆。有意不自动删:
+    它是坏字节的唯一证据, 自动清理会引入"证据能自己消失"的新问题; 什么时候删由人定。
+    """
+    err = ""
+    created = False
+    seen_path = out_path + ".seen"
+    try:
+        with open(out_path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+    except FileNotFoundError:
+        existing, created = [], True
+    except Exception as e:
+        existing, err = [], "%s: %s" % (type(e).__name__, e)
+
+    merged, ok = merge_results(existing, summary, known)
+    if not ok:
+        err = err or ("顶层是 %s 而不是 list" % type(existing).__name__)
+        merged = []                       # readable=False 时 merge_results 已返回 [], 这里只是说清口径
+
+    if created:
+        # v2.3.36 (审查方 M2): 只看"文件不在"不够 —— 上一轮 unrepaired 之后文件也是不在的
+        # (坏表已被 os.replace 挪去隔离, 新文件又没写成), 与首次部署完全同形。
+        status = "created_after_writefail" if os.path.exists(seen_path) else "created"
+    else:
+        status = "ok"
+    if err:
+        merged, _ = merge_results([], summary, known)      # 重建: 只剩本轮结论(旧账在隔离文件里)
+        _ts = int(time.time() if ts is None else ts)
+        _base_bak = "%s.corrupt-%d" % (out_path, _ts)
+        # v2.3.36 (审查方 M3): 秒级时间戳在同一秒内隔离两次会**覆盖前一份坏证据**。概率极低
+        # (一轮 3405s), 但"坏证据被悄悄覆盖"这件事事后无法发现 —— 加序号, 代价三行。
+        _bak, _n = _base_bak, 1
+        while os.path.exists(_bak):
+            _bak = "%s-%d" % (_base_bak, _n)
+            _n += 1
+        status = "rebuilt"
+        try:
+            os.replace(out_path, _bak)
+        except Exception as e2:
+            _bak = "[隔离失败 %s: %s]" % (type(e2).__name__, e2)
+            status = "rebuilt_noquarantine"
+        print(f"  [warn] results.json 读不出来({err}) —— 已隔离到 {_bak}, 用本轮结果重建。"
+              f"旧账这次丢了(hotspares 与劣化基准回到本轮), 但**不隔离会永久卡住**: "
+              f"下一轮读到的是同一个坏文件, load_record 恒 0.0(劣化档永久关闭)、"
+              f"load_hotspares 恒 [](止血没备胎), 且永不恢复。", flush=True)
+
+    try:
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, out_path)
+        try:
+            with open(seen_path, "w", encoding="utf-8") as _sf:
+                _sf.write("%d\n" % int(time.time() if ts is None else ts))
+        except Exception:
+            pass          # 标记写不成 -> 下一轮的 created 退化成有损, 不值得让整轮失败
+    except Exception as e:
+        print(f"  [warn] results.json 写不进去({type(e).__name__}: {e}) —— "
+              f"本轮结论只留在 speed.log, 下一轮重试"
+              + ("(上一轮的坏表已被隔离挪走, 所以下一轮会看到『文件不在但有 .seen』)"
+                 if status.startswith("rebuilt") else ""), flush=True)
+        status = "unrepaired"
+    return merged, status
+
+
+def cand_rank(ip, score, skip):
+    """候选截断排序键(升序 sort): 有分 > 没测到 > 测了 0 / 不在粗筛表。
+
+    v2.3.35 (审查方 P2-5): 原来是 `score.get(ip, 0.0)`, 而 `score` 里只有 sp > 0 的 IP ——
+    于是"预算用尽、这一路根本没测到"(`screen_skip`) 与"测了是 0 分"(`screen_zero`) 在排序里
+    **完全等价**。两者物理含义相反: 没测到 = 未知(可能很快), 测了 0 = 已知拿不到数据。
+    截断时把未知排在已知差之前 —— 丢一个未知节点是主动放弃可能的快节点, 丢一个 0 分节点
+    只是丢掉本来就没用的, 代价顶多是那几十秒快测。
+
+    抽成模块函数只为了能被审计直接喂(嵌在 test_pool 里的 lambda 只能靠行为反推)。
+    组内仍按分数降序(等价于原来的 reverse=True)。
+    """
+    # 档位用 10/20/30 而不是 0/1/2: 出口棘轮(B1) 把"首元素是 0/False 的元组返回"当成失败出口,
+    # 而这三行只是排序键。数字只是档位, 换成 0/1/2 会让 B1 凭空多出一条"失败路径"。
+    if ip in score:
+        return (10, -score[ip], 0)
+    if ip in skip:
+        return (20, 0.0, 0)
+    return (30, 0.0, 0)
+
+
+def mark_retest(groups=None):
     """记下"本轮跑过", 供 watchdog 的重测冷却判断。
 
     没有这个标记时: 某组整夜死着(整区段故障/热备全灭), 每小时 :30 的看门狗都会触发一次定向重测。
@@ -626,10 +878,33 @@ def mark_retest():
     单组实测 3.71GiB -> 24 次/天 ≈ 89GiB, 且大概率测完还是老样子。
     main 里调用两次(开头 + 正常结束): 只打在开头时, 长跑会把自己的冷却吃掉(见 main 尾部注释)。
     单写者: 只有本程序写, 看门狗只读 —— 两边各写一份迟早口径不同。
+
+    v2.3.34 (审查方 P2-D): 标记**按组**了(JSON `{"Cn1": epoch, "Cn2": epoch}`)。
+    原来只有一个 epoch, `--pool Cn1` 的一次定向重测会把 Cn2 的冷却一起重置: 08:30 修了 Cn1,
+    09:00 Cn2 整组死, 09:30 的看门狗只止血不重测 Cn2, 最长压 3 小时; 反向同样成立。
+    合并语义(**只动本轮测的组**, 其余组的格原样保留): 若这里整体覆盖, Cn1 的一次重测就会把
+    Cn2 的标记抹掉 -> 冷却清零 -> 反而更容易触发一次 3.71GiB, 与冷却的初衷相反。
     """
     try:
+        p = os.path.join(BASE, RETEST_MARK_NAME)
+        cur = {}
+        try:
+            with open(p, encoding="utf-8") as fh:
+                raw = (fh.read() or "").strip()
+            obj = json.loads(raw) if raw else {}
+            if isinstance(obj, dict):
+                cur = dict((k, v) for k, v in obj.items() if isinstance(v, (int, float)))
+            elif isinstance(obj, (int, float)):     # 旧格式: 一格管全部组 -> 升级时按组展开
+                cur = dict((g[0], obj) for g in POOLS)
+        except Exception:
+            cur = {}
+        now = int(time.time())
+        for g in (groups if groups is not None else [p0[0] for p0 in POOLS]):
+            cur[g] = now
+        # 写模式**留在一行里**: C49 按"同一行既出现标记名又出现写模式"判写者(它吃过
+        # 跨行匹配写歪的亏)。拆成 p = join(...); open(p,"w") 会让那条断言数出 0 个写者。
         with open(os.path.join(BASE, RETEST_MARK_NAME), "w", encoding="utf-8") as fh:
-            fh.write("%d\n" % int(time.time()))
+            fh.write(json.dumps(cur, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass      # 标记写不进去(只读盘/权限)绝不能影响测速本身
 
@@ -729,16 +1004,25 @@ def decision_note(cand, thr):
     if len(rs) < 2 or thr <= 0:
         return ""
     good = [v for v in rs if v > 0]
-    tag = "" if len(good) == len(rs) else f"仅 {len(good)}/{len(rs)} 轮出数, "
+    # v2.3.35 (审查方 N3): 极差必须跟 median **同口径**。median_of 去 0(0 表示"这一轮没测出",
+    # 不是 0MiB/s), 而 min/max 原来吃的是含 0 的 rs —— 于是 0/45/47 会打出
+    # 「受抖动支配(三轮 0.0~47.0 横跨阈值)」, 把**一轮没测出来**说成**抖动**。
+    # 这两件事的处置方向相反: 抖动该等下一轮, 没测出该查网络/查节点(零值那行日志逐轮打过了)。
+    lo, hi = (min(good), max(good)) if good else (0.0, 0.0)
     med = median_of(rs)
-    lo, hi = min(rs), max(rs)
-    if med <= 0 or (hi - lo) <= med * 0.25:      # 本来就够稳, 不刷屏
+    if med <= 0 or not good:            # 一轮都没出数: 不出声(零值那行日志已经逐轮打过了)
         return ""
+    _few = len(good) < len(rs)
+    # 三轮都出数且极差很小 = 本来就稳, 不刷屏。**有轮次没出数时照打** —— 哪怕出数轮彼此一样,
+    # "这个判定只基于 1/3 轮"本身就是要说的话(C42b 钉的就是这条: 1/3 轮出数不能听起来像三轮都成)。
+    if not _few and (hi - lo) <= med * 0.25:
+        return ""
+    tag = "" if not _few else f"仅 {len(good)}/{len(rs)} 轮出数(其余轮 0=没测出), "
     if hi < thr:
         return f"稳健({tag}最好一轮 {hi:.1f} 仍 < 阈值 {thr:.1f}, 抖不动)"[:200]
     if lo >= thr:
         return f"稳健({tag}最差一轮 {lo:.1f} 已 > 阈值 {thr:.1f}, 抖不掉)"
-    return (f"**受抖动支配**({tag}三轮 {lo:.1f}~{hi:.1f} 横跨阈值 {thr:.1f}, "
+    return (f"**受抖动支配**({tag}出数轮 {lo:.1f}~{hi:.1f} 横跨阈值 {thr:.1f}, "
             f"换不换取决于抽到哪一轮, 下轮可能翻转)")
 
 
@@ -1029,7 +1313,8 @@ def steady_top_diverse(results, exclude, host, url_path, tags, n=2, avoid_ops=()
 
 def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=None,
                  screen_capped=None, quick_skip=None, screen_skip=None, screen_zero=None,
-                 screen_wave=None, screen_cap=None):
+                 screen_wave=None, screen_floor=None, screen_need=None,
+                 t_screen=None, t_quick=None):
     """构造 samples.jsonl 的一行 —— **纯函数**: 只吃本轮已测出来的数, 不读盘, 不碰决策。
 
     字段为什么是这几个:
@@ -1053,14 +1338,32 @@ def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=N
                  而两者对下一轮的含义正相反。quick 有 `quick_skip`、l0 有 `l0_pool/probed/alive`,
                  粗筛这一遍原来漏了 —— 同一个论证写两遍漏一遍。
       screen_wave —— 每个 IP 粗筛时**进场那一刻**同批在跑的请求数(含自己), 见 `_screen` docstring。
-                 它回答的是「同节点跨轮分数漂移, 是对手变了还是节点变了」: 4 路并发下 8MiB 的读数
-                 本来就是被平分过的一份, 没有这一列就连"这轮分数低"都无法归因。**只观测不改行为。**
-      screen_cap —— 本轮**单路**的撞顶线(MiB/s) = SPEED_CEIL_MIB / max(screen_wave)。80 是每路的,
-                 4 路并存时每路只有 20 —— 也就是说 `screen_capped` 空的时候, 光看它分不清
-                 「这一档根本撞不到」(必然) 与「真没人撞」(可能)。这一列就是那个理由:
-                 空 capped + cap=20.0 ⇒ 结构性; 空 capped + cap=None ⇒ 没记(样本来自旧版);
-                 capped 非空 ⇒ 分数只是下界, 且能拿 cap 复核(分数必须 >= cap)。
+                 它回答的是「同节点跨轮分数漂移, 是对手变了还是节点变了」。**只观测不改行为。**
+                 注意它**不是**"分数被平分的份数": 平分只在出口被打满时成立, 而真机实测
+                 (2026-11-08 04:00) 4 路并存下最高单路 73.2MiB/s —— 若真平分, 上限会是 need/4 = 20,
+                 观察值超了 3.6 倍, 说明出口没饱和、各节点跑的是自己的回源速度。这条区别是
+                 v2.3.34 拆 screen_floor/screen_need 的直接原因。
+      screen_floor —— 撞顶线本身(MiB/s), 恒 = SPEED_CEIL_MIB = 80.0, **与并发无关**。
+                 v2.3.34 之前这一列叫 screen_cap, 记的是 80/max(wave) —— 而那是"出口被均分时
+                 每路能分到多少", 不是"撞顶线在哪"。名字套错造成了实测可见的自相矛盾:
+                 2026-11-08 04:00 真机 Cn1 的 48 个分数里 **41 个超过 20.0**, 而 screen_capped 是空的
+                 —— 一个分数不可能超过它自己的撞顶线, 20.0 这个数从一开始就不是那条线。
+                 定义蕴含的不变式: `max(screen) <= screen_floor` 恒成立(capped 判据是 el < SPEED_MIN_EL,
+                 分数 = 8MiB/el, 所以超过 80 在算术上不存在)。这条不变式由审计 C85 在真样本上验。
+      screen_need —— 达到撞顶所需的**出口总带宽**(MiB/s) = SPEED_CEIL_MIB × max(screen_wave)。
+                 4 路满编时 320.0。它才是"这一档撞不撞得到"的判据: 拿实测最高单路分 × wave
+                 反推出口下界, 小于 need 就**结构上撞不到**, 与"真没人撞"无关。
+                 **故意不记 80/wave**: 那个数恒等于 SPEED_CEIL_MIB/wave, 不含任何观测信息,
+                 而且它正是上面那次误读的来源 —— 留着它等于把坑留着。要均分份额, 用 need 反算。
       t_l0    —— L0 耗时。池子越长越慢, 有序列才知道 cron 里 03:50 那口子留得够不够。
+      t_screen / t_quick —— 粗筛/快测分段耗时(秒), v2.3.34 补(审查方 P2-E)。
+                 原来这两段只由 `[t]` 那行打给人看, 进 samples 之前被 `r.pop("_t")` 扔掉,
+                 于是 3405 秒一轮里"哪一段在变慢"事后算不出来; 而 `t_l0` 写进了每一行、正文
+                 一次都没读过 —— 字段存在只是为了过回放器的 WANTED 检查。
+                 现在三段都进样本, replay 出一段分段耗时的 P50/P90。
+                 (v2.3.35: 原来 test_pool 返回值的 `_t` 键与 main 里那句 `r.pop("_t")` 已删 ——
+                 分段耗时只存在样本里这一份, results.json 里从来没有过; 留着那个键会让下一个人
+                 以为它曾经进过 results.json。)
     决策字段(ip/speed/decision)不在这里定: 同一个 IP 可能被后续迟滞判"保持", 样本必须记**最终**
     落进 results.json 的那个结论, 否则两者会打架。所以那三个由 main 落盘时补上。
     判定输入(cur/wr/st_cur/st_cand/q_cur)同理不进这里 —— 它们在 test_pool 里还不存在。
@@ -1079,11 +1382,15 @@ def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=N
         "screen_skip": list(screen_skip or []),
         "screen_zero": list(screen_zero or []),
         "screen_wave": dict((k, v) for k, v in (screen_wave or {}).items() if v is not None),
-        # 撞顶线随并发档位变: 记下来, "capped 空"才有理由可读(见 docstring screen_cap)
-        "screen_cap": (round(screen_cap, 1) if screen_cap else None),
+        # 撞顶线恒 80(每路), 与并发无关; need = 达到它所需的出口总带宽。两者分开记的理由见
+        # docstring screen_floor —— 一个名字指两个量曾让 41/48 的分数"超过自己的上限"。
+        "screen_floor": (round(screen_floor, 1) if screen_floor else None),
+        "screen_need": (round(screen_need, 1) if screen_need else None),
         "quick": {ip: round(sp, 1) for ip, sp in quick.items()},
         "quick_skip": list(quick_skip or []),
         "t_l0": round(t_l0, 1),
+        "t_screen": (round(t_screen, 1) if t_screen is not None else None),
+        "t_quick": (round(t_quick, 1) if t_quick is not None else None),
     }
 
 
@@ -1139,25 +1446,35 @@ def test_pool(name, path, host, url_path, current_ip, sample_sink=None):
                      ms_of=dict((ip, ms) for ms, ip, _t in prox), capped_out=_screen_capped,
                      skip_out=_screen_skip, zero_out=_screen_zero, wave_out=_screen_wave)
     t_screen = time.perf_counter() - t_start - t_l0
-    # 撞顶线是**每路**的, 所以它随并发档位变: 4 路并存时每路只分到总带宽的 1/4, 要撞
-    # 80MiB/s 得先有 320MiB/s 总带宽。真机取证 (NAS samples.jsonl 3 条 / 143 个粗筛分数):
-    # P50 21.6 / P90 35.7 / max 62.7 / 到 80 的 0 个 ⇒ `screen_capped` 在现行档位下结构性恒空。
-    # 而这个"空"与"真没人撞"同形 —— P1-B 那个论证的第四遍, 这次钉在 capped 上。
+    # 撞顶线是**每路**的, 恒 = 80MiB/s, **与并发无关**。并发改变的不是这条线, 而是"够不够得着"
+    # 它: 4 路满编时要有一路跑到 80, 出口总带宽得有 80×4 = 320MiB/s。
+    # v2.3.32/33 这里算的是 `SPEED_CEIL_MIB / wave`(=20.0), 把"更难达到"记成了"门槛下降"。
+    # 2026-11-08 04:00 真机自证: Cn1 的 48 个分数里 41 个 > 20.0, 而 screen_capped 是空的 ——
+    # 分数不可能超过自己的撞顶线, 所以 20.0 一开始就不是那条线(C83 警告过的误读, 我把它写进了代码)。
+    # 现在的说法用观测值反推出口下界, 与 need 一比就自明, 不需要任何"均分"假设。
     _wave_max = max(_screen_wave.values()) if _screen_wave else 0
-    _cap_line = (SPEED_CEIL_MIB / _wave_max) if _wave_max else SPEED_CEIL_MIB
+    _floor_line = SPEED_CEIL_MIB                                   # 80.0, 恒
+    _need_line = (SPEED_CEIL_MIB * _wave_max) if _wave_max else None
+    _sp_max = max((sp for sp, _ in ranked), default=0.0)
     if not _screen_capped and _wave_max > 1:
-        print(f"  粗筛: 最大并发 {_wave_max} 路 ⇒ 单路撞顶线只有 {_cap_line:.1f}MiB/s"
-              f"(串行才是 {SPEED_CEIL_MIB:.0f}); capped 空是这一档撞不到, 不是没人撞", flush=True)
+        _rev = _sp_max * _wave_max
+        print(f"  粗筛: {_wave_max} 路并存 ⇒ 撞顶(单路 {_floor_line:.0f}MiB/s)需出口 ≥ {_need_line:.0f}MiB/s; "
+              f"实测最高单路 {_sp_max:.1f} ⇒ 出口至少 {_rev:.0f}"
+              + ("  < need ⇒ capped 结构性为空, 不是没人撞" if _rev < _need_line
+                 else "  >= need ⇒ 该有 capped 却没有, 先查计时器"), flush=True)
     top = [ip for _, ip in ranked[:SCREEN_N]]
     # 本地省份节点保送确认: 粗筛小块+并发会低估本地节点, 防止漏选(本地运营商节点延迟优势最大)。
     # 保送名单只从 L0 入选者里取 —— 标签不能再把慢节点塞进快测, 但可以在入选者里优先。
     prov = [(ip, tag) for ip, tag in screen_rows if any(r in tag for r in SCREEN_REGIONS)]
     gd = [ip for ip, _tag in prov]
     score = dict((ip, sp) for sp, ip in ranked)
+    _skip_set = set(_screen_skip)
     cands = list(dict.fromkeys(top + gd + ([current_ip] if current_ip else [])))
     n_before = len(cands)
     # 按粗筛分降序截断, 当前 IP 必留(它是迟滞基准, 丢了就无法判断"该不该换")
-    cands.sort(key=lambda i: score.get(i, 0.0), reverse=True)
+    # v2.3.35 (审查方 P2-5): 三态排序键见 `cand_rank()` —— 有分 > 没测到 > 测了 0。
+    # **这是本轮唯一动到排序的地方**, 影响面仅限"同为 0 分的候选之间谁先被截掉"。
+    cands.sort(key=lambda i: cand_rank(i, score, _skip_set))
     if len(cands) > MAX_QUICK_CANDS:
         keep = cands[:MAX_QUICK_CANDS]
         if current_ip and current_ip not in keep:
@@ -1198,7 +1515,8 @@ def test_pool(name, path, host, url_path, current_ip, sample_sink=None):
     _smp = build_sample(name, t_l0, prox, ranked, quick, tag_of, _rtt_tail, _rtt_stats,
                         screen_capped=_screen_capped, quick_skip=quick_skip,
                         screen_skip=_screen_skip, screen_zero=_screen_zero,
-                        screen_wave=_screen_wave, screen_cap=_cap_line)
+                        screen_wave=_screen_wave, screen_floor=_floor_line, screen_need=_need_line,
+                        t_screen=t_screen, t_quick=t_quick)
     if sample_sink is not None:
         sample_sink.append(_smp)
     # 预算提前 break 时 quick 里没有剩余候选的键, 必须按 quick 取而不是按 cands(否则 KeyError)
@@ -1209,8 +1527,7 @@ def test_pool(name, path, host, url_path, current_ip, sample_sink=None):
     print(f"  -> 快测冠军 {ip} {tag_of.get(ip, '').strip()[:28]} median={sp:.1f}MiB/s", flush=True)
     return {"group": name, "ip": ip, "speed": round(sp, 1), "quick": quick,
             "region": tag_of.get(ip, "").strip()[:40], "rows": full_rows,
-            "tag_of": tag_of, "ranked": results,
-            "_t": {"screen": round(t_screen, 1), "quick": round(t_quick, 1)}}
+            "tag_of": tag_of, "ranked": results}
 
 
 def router_cmd(cmd):
@@ -1323,7 +1640,7 @@ def main():
     # 标记打在**路由器可达之后**: 什么都不测的早退轮不该占满 3 小时冷却。v2.3.16 把它放在拿锁之后,
     # 于是路由器瞬断一次, 看门狗接下来 3 小时都不重测 —— 而那恰恰是最该立刻重试的时刻。
     # 收尾还会再打一次(冷却从"测完"算), 单写者不变。
-    mark_retest()
+    mark_retest([p0[0] for p0 in pools])
     hist = parse_hist(current) if current else {}
     cur_ip = {}
     for name, _p, _h, _u, doms in POOLS:
@@ -1365,7 +1682,9 @@ def main():
         quick = r.pop("quick", {})   # 完整快测表(含 0 分与"预算跳过"的区别): q_cur 只能从这里取
         r.pop("rows", None)        # 全池明细不落盘(看门狗只用 hotspares, 白占体积)
         tags = r.pop("tag_of", {})   # 热备分散要用运营商标签, 但不落盘
-        r.pop("_t", None)            # 分段计时只给人看, 不进 results.json
+        # v2.3.35 (审查方 N4): 这里原来还有一行 `r.pop("_t", None)`。t_screen/t_quick 进样本之后
+        # 那个 `_t` 已经**没有任何读者**(唯一效果是让下一个读代码的人以为 results.json 带分段耗时),
+        # 于是返回值里那个键也一起删了 —— 没有字段就不需要 pop。
         # 样本由 test_pool 经 sample_sink 直接交给 samples, 不经过 r —— results.json 里
         # 只出现冠军与热备这两类结论, watchdog 读的那个文件不会被分布灌胖。
         if cand == cur_ip[name]:
@@ -1530,20 +1849,16 @@ def main():
           f" (实测节点 {_STEADY_NODES[0]} 个 × {STEADY_ROUNDS} 轮 × 单次上限 "
           f"{STEADY_MAX_BYTES // 1048576}MiB)", flush=True)
     # 按组合并写入(--pool 定向重测只测一组, 不得覆盖另一组的热备名单) + 原子写(防看门狗读到半截)
+    # v2.3.34 (审查方 P1-B): 原来 existing 读失败/非 list 一律当 [], 再按 POOLS 过滤写回 ——
+    # 三条路径都能**静默抹掉一整组**: ①json.load 抛异常 ②顶层不是 list ③该组不在 POOLS 里
+    # (手工 `--pool Cn1` 定向重测就够, 不需要任何异常)。后果不是"少一行日志":
+    # load_record('Cn2') 回到 0.0 -> DEGRADE_MIN_RECORD 门槛恒假、劣化档永久关闭;
+    # load_hotspares('Cn2') 回到 [] -> 止血连备胎都没有; 而这两件事在日志里都不吭声。
+    # v2.3.35 (审查方 N1): 上一版把"不丢组"做成了"这一轮不写", 于是坏文件一旦出现就再也
+    # 不会被重写 —— 永久故障。读/合并/隔离/写整段已抽成 persist_results(), 坏表先隔离再重建,
+    # C86 直接喂"坏表跑两轮"验第二轮自愈(而不是只验第一轮没覆盖)。
     out_path = os.path.join(BASE, "results.json")
-    try:
-        existing = json.load(open(out_path, encoding="utf-8"))
-        existing = existing if isinstance(existing, list) else []
-    except Exception:
-        existing = []
-    by_group = {g.get("group"): g for g in existing if isinstance(g, dict)}
-    for g in summary:
-        by_group[g["group"]] = g
-    merged = [by_group[p[0]] for p in POOLS if p[0] in by_group]
-    tmp = out_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, out_path)
+    _merged, _st = persist_results(out_path, summary, [p[0] for p in POOLS])
     # samples.jsonl: 每轮每组一行, 只 append。**决策一次都不读它** —— 读回就会悄悄改变行为,
     # 而这条项目在"看着像没变其实变了"上吃过太多次亏(A24 把这条钉住: 除了 append,
     # 源码里不许有第二个引用)。
@@ -1556,7 +1871,7 @@ def main():
     # 收尾再打一次标记: 冷却要按"上一次重测**测完**"算。只打在开头的话, 一次 3405s 的定向重测
     # 结束那一刻标记已经过期 3405s —— 比整个冷却窗口还长, 下一小时必然放行, 等于没有冷却。
     # 仍是同一个 mark_retest(单写者不变); 中途异常退出时开头那次标记留在原地, 退化成"从开始算"。
-    mark_retest()
+    mark_retest([p0[0] for p0 in pools])
 
 
 if __name__ == "__main__":

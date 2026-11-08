@@ -109,9 +109,21 @@
   M102 空 ms_of 回 inf (第二键失效、第三键接管: 握手最快的排到最后)  -> C80
   M103 replay 默认 None (不带参数就不回放: 翻转恒 0, docstring 却说默认 1.15)  -> C81
   M104 WANTED 少一键 (回放器不再点名 screen_zero: 三态对称又断一半)  -> C78
-  M105 样本硬写串行撞顶线 (screen_cap 恒 80.0: 4 路下『撞不到』读成『都没到 80』)  -> C82
-  M106 常量把并发摊进节点上限 (线变 20, 实测 P50 21.6 -> capped 恒满)  -> C83
-  M107 生产路径不看并发 (_cap_line 恒等 SPEED_CEIL_MIB: 样本永远记 80.0)  -> C84
+  M105 need 记成 floor (screen_need 硬写 80.0: 两个量又混成一个, 『撞不到』的解释没了)  -> C82
+  M106 常量把并发摊进节点上限 (线变 20, 实测 P50 33 -> 41/48 超线而 capped 空)  -> C83
+  M107 消费点再除一次并发 (回归 v2.3.33 真 bug: _floor_line=80/wave_max, 4 路变 20.0)  -> C84
+  M108 合并抹掉 POOLS 外的组 (删原地保留那行: 临时注释掉某组后的存留被顺手删)  -> C86
+  M109 旧表读不出当正常 (非 list 也 readable=True: 拿 [] 当没有旧账, 另一组被静默抹掉)  -> C86
+  M110 止血返回值不接 (pins 停在 get_pins 那刻: 两组同轮切同一 IP 时跨组 warn 永不响)  -> C87
+  M111 冷却不分组 (retest_cooldown_left 忽略 name: 一组重测压住另一组 3 小时)  -> C88
+  M112 分段耗时只留 t_l0 (删 t_screen: 3405s 一轮事后算不出哪一段在变慢)  -> C89
+  M113 canary 又把 bool 还回来 (return ok: False 同时代表 gone/denied/unknown/failed)  -> C90
+  M114 回退成"读不出就不写" (坏表永不被重写: 劣化档永久关闭 + 止血恒无备胎, 且自我维持)  -> C86b
+  M115 三态压回同一个键 (skip 与 zero 同权: 截断先扔掉"未知"节点)                        -> C91
+  M116 极差吃 0 值 (把"一轮没测出来"说成"抖动", 处置方向正好相反)                        -> C92
+  M117 screen_wave 只存一个 max (回退成"不是逐 IP", 4 路分摊就真的测不了了)            -> C93
+  M118 status 不区分 created / created_after_writefail (写失败与首次部署同形)           -> C86b
+  M119 隔离文件名不再加序号 (同一秒两次隔离, 前一份坏证据被覆盖)                        -> C94
 
 用法: python3 tests/selftest_audit.py        退出码 0 = 审计器可信
 """
@@ -217,7 +229,7 @@ MUTANTS = [
     ("M30", "零值轮次不报 (0/0/100 只当中位 100.0, 不说几轮为 0)", "xbox-speedtest.py", "C42",
      "    if zeros:\n", "    if False:\n"),
     ("M31", "出数轮数不报 (判定措辞把 1/3 轮出数说成三轮都成)", "xbox-speedtest.py", "C42b",
-     "    tag = \"\" if len(good) == len(rs) else f\"仅 {len(good)}/{len(rs)} 轮出数, \"",
+     '    tag = "" if not _few else f"仅 {len(good)}/{len(rs)} 轮出数(其余轮 0=没测出), "',
      "    tag = \"\""),
     # 快测值顶账: 只改 alive 那一条分支(同一条件在 same-ip 分支已修), 看审计能不能抓出"两处两种记账"
     # 锚点必须带上它前面那行注释: r["speed"] = 0.0 全文件有 4 处, 裸替换会把别的分支一起改坏(C0 崩)
@@ -238,21 +250,27 @@ MUTANTS = [
     # v2.3.14: 两条补丁各自的失效形态。冷却与 DoH 都是"看起来在跑、实际不起作用"的类型,
     # 只能靠行为断言(标记时间 -> 是否触发)和语法事实(还有没有 getaddrinfo)分别钉住。
     ("M37", "冷却失效 (watchdog 拿到冷却值又乘 0, 等于没有冷却)", "watchdog.py", "C48",
-     "        left = retest_cooldown_left()", "        left = retest_cooldown_left() * 0"),
+     "            _left = retest_cooldown_left(g)", "            _left = retest_cooldown_left(g) * 0"),
     ("M38", "未来时间戳不设防 (时钟回拨/误写一次就能把重测冻死)", "watchdog.py", "C48d",
      "    if dt < 0:\n        return 0\n", ""),
     # 多行注入点一律用三引号直写: 用 "\n" 转义时, 生成脚本里的反斜杠被处理坏过一次(整条变异静默失效)
+    # v2.3.34: 读标记改成 JSON 后原来的 `with open(...) / last = int(...)` 两行没了 —— 注入串换成
+    # "读完标记、还没解析"那一格, 在那里插一句写, 正好是"看门狗也去写标记"的形态。
     ("M39", "双写者 (watchdog 也去写冷却标记, 两边口径迟早不同)", "watchdog.py", "C49",
-     '''        with open(os.path.join(BASE, RETEST_MARK_NAME), encoding="utf-8") as fh:
-            last = int((fh.read() or "0").strip() or 0)
+     '''    if not raw:
+        return 0
+    last = None
 ''',
-     '''        with open(os.path.join(BASE, RETEST_MARK_NAME), encoding="utf-8") as fh:
-            last = int((fh.read() or "0").strip() or 0)
-        open(os.path.join(BASE, RETEST_MARK_NAME), "w").write("0")
+     '''    open(os.path.join(BASE, RETEST_MARK_NAME), "w", encoding="utf-8").write("0")
+    if not raw:
+        return 0
+    last = None
 '''),
+    # v2.3.34: 标记写的是 JSON `{group: epoch}`。这条的形态仍是"打了标记但等于没打"——
+    # 整段写盘换成 pass。它同时会红 C49(写者 0 个), 那是同一个动作的第二个侧面, 不算假红。
     ("M40", "主程序不打标记 (看门狗拿不到冷却依据, 退化成无退避)", "xbox-speedtest.py", "C49b",
      '''        with open(os.path.join(BASE, RETEST_MARK_NAME), "w", encoding="utf-8") as fh:
-            fh.write("%d\\n" % int(time.time()))
+            fh.write(json.dumps(cur, ensure_ascii=False, sort_keys=True) + "\\n")
 ''',
      '''        pass
 '''),
@@ -272,7 +290,7 @@ MUTANTS = [
      "RETEST_COOLDOWN = 3 * 3600", "RETEST_COOLDOWN = 45 * 60"),
     ("M44", "只在开头打标记 (去掉收尾那次, 57 分钟的长跑自己吃掉整个冷却窗口)", "xbox-speedtest.py", "C51",
      '    # 仍是同一个 mark_retest(单写者不变); 中途异常退出时开头那次标记留在原地, 退化成"从开始算"。\n'
-     '    mark_retest()',
+     '    mark_retest([p0[0] for p0 in pools])',
      '    # 仍是同一个 mark_retest(单写者不变); 中途异常退出时开头那次标记留在原地, 退化成"从开始算"。'),
     ("M45", "同 IP 不落盘 (同 IP 分支不再调 router_apply, '切了一半'永远不修)", "xbox-speedtest.py", "C52",
      "            _ch, _det = router_apply(doms, cand, current)",
@@ -431,8 +449,8 @@ MUTANTS = [
     # 返回值": 那样它会跟着 r 进 results.json(main 只 pop 了 ranked/quick/rows/tag_of/_t)。
     ("M83", "样本漏进结论 (把 \"_sample\" 挂回返回值: results.json 被分布灌胖, watchdog 读的文件变样)",
      "xbox-speedtest.py", "A24",
-     '"_t": {"screen": round(t_screen, 1), "quick": round(t_quick, 1)}}',
-     '"_t": {"screen": round(t_screen, 1), "quick": round(t_quick, 1)}, "_sample": _smp}'),
+     '            "tag_of": tag_of, "ranked": results}',
+     '            "tag_of": tag_of, "ranked": results, "_sample": _smp}'),
     # M84-M86 打 canary 的三条边: 不调用(等于没加) / 只认 200(正常 206 每小时误报成下架) /
     # 绑 IP(单台节点坏了伪装成 URL 下架)。后两条都是"能报警但报错", 比不报更能训练人忽略日志。
     # v2.3.31: 注入点跟着实现走 —— main 里那两行从 `for _cn in CANARY: canary(_cn)` 换成了
@@ -563,18 +581,77 @@ MUTANTS = [
     # M105 样本硬写串行 80: 读样本的人会以为「4 路下没撞顶」= 节点都没到 80, 其实这一档撞不到
     # M106 常量把并发摊进去: 4 路下这条线变 20, 而实测 P50 就是 21.6 -> 一半以上节点"撞顶", capped 恒满
     # M107 test_pool 不看 wave: 生产路径恒记 80.0, 与 M105 一样抹掉档位, 但 C82 仍绿(它只测 build_sample)
-    ("M105", "样本硬写串行撞顶线 (build_sample 的 screen_cap 恒 80.0: 4 路下『撞不到』读成『都没到 80』)",
+    ("M105", "样本把 need 记成 floor (screen_need 硬写 80.0: 两个量又混成一个, 4 路『撞不到』的解释没了)",
      "xbox-speedtest.py", "C82",
-     '        "screen_cap": (round(screen_cap, 1) if screen_cap else None),',
-     '        "screen_cap": 80.0,   # 变异: 不看并发档位, 硬写串行线'),
-    ("M106", "常量把并发摊进节点上限 (SPEED_CEIL_MIB 再除以 4: 线变 20, 实测 P50 21.6 -> capped 恒满)",
+     '        "screen_need": (round(screen_need, 1) if screen_need else None),',
+     '        "screen_need": 80.0,   # 变异: 把"达到撞顶所需出口"记成撞顶线本身'),
+    ("M106", "常量把并发摊进节点上限 (SPEED_CEIL_MIB 再除以 4: 线变 20, 实测 P50 33 -> 41/48 超线而 capped 空)",
      "xbox-speedtest.py", "C83",
      'SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / SPEED_MIN_EL   # 80.0',
      'SPEED_CEIL_MIB = SCREEN_CHUNK / 1048576 / (SPEED_MIN_EL * 4)   # 变异: 把每路线摊成节点线'),
-    ("M107", "生产路径不看并发 (test_pool 的 _cap_line 恒等于 SPEED_CEIL_MIB: 样本永远记 80.0)",
+    ("M107", "消费点再除一次并发 (回归 v2.3.33 的真 bug: _floor_line = 80/wave_max, 4 路变 20.0)",
      "xbox-speedtest.py", "C84",
-     "    _cap_line = (SPEED_CEIL_MIB / _wave_max) if _wave_max else SPEED_CEIL_MIB",
-     "    _cap_line = SPEED_CEIL_MIB   # 变异: 不看 max(screen_wave)"),
+     "    _floor_line = SPEED_CEIL_MIB                                   # 80.0, 恒",
+     "    _floor_line = SPEED_CEIL_MIB / (_wave_max or 1)   # 变异: 把'更难达到'记成'门槛下降'"),
+    ("M108", "合并时抹掉 POOLS 之外的组 (删掉原地保留那一行: 临时注释掉某组后的存留被顺手删)",
+     "xbox-speedtest.py", "C86",
+     '    merged += [g for g in by_group.values() if g.get("group") not in known]\n',
+     ''),
+    ("M109", "旧表读不出当正常 (非 list 也返回 readable=True: 拿 [] 当'没有旧账', 另一组被静默抹掉)",
+     "xbox-speedtest.py", "C86",
+     "    if not isinstance(existing, list):\n        return [], False",
+     "    if not isinstance(existing, list):\n        return [], True   # 变异: 损坏表当正常态"),
+    ("M110", "止血返回值不接 (pins 停在 get_pins 那一刻: 两组同轮切到同一 IP 时跨组 warn 永远不响)",
+     "watchdog.py", "C87",
+     "                    if _r:\n                        pins[name] = _r",
+     "                    if _r:\n                        pass   # 变异: 丢掉 quick_fix 的返回值"),
+    ("M111", "冷却不分组 (retest_cooldown_left 忽略 name: 一组重测压住另一组 3 小时)",
+     "watchdog.py", "C88",
+     "            if name is not None:\n                last = obj.get(name)",
+     "            if False:   # 变异: 不看组, 永远取全表最新\n                last = obj.get(name)"),
+    ("M112", "分段耗时只留 t_l0 (删掉 t_screen: 3405s 一轮事后算不出哪一段在变慢)",
+     "xbox-speedtest.py", "C89",
+     '        "t_screen": (round(t_screen, 1) if t_screen is not None else None),\n',
+     ''),
+    ("M113", "canary 又把 bool 返回回来 (return ok: False 同时代表 gone/denied/unknown/failed)",
+     "watchdog.py", "C90",
+     '    elif state is not None:\n        state[name] = "ok"',
+     '    elif state is not None:\n        state[name] = "ok"\n    return ok   # 变异: 把有损副本还回来'),
+
+    # M114-M116 打 v2.3.35 的三条新断言。M114 专门回退成 v2.3.34 的那一刻: 诊断不是"少一个功能",
+    # 而是"坏文件从此再也不会被重写", 只有**连跑两轮**才看得出来。
+    ("M114", "回退成\"读不出就不写\" (坏表永远不被重写: load_record 恒 0.0、止血恒无备胎, 且自我维持)",
+     "xbox-speedtest.py", "C86b",
+     '        merged, _ = merge_results([], summary, known)      # 重建: 只剩本轮结论(旧账在隔离文件里)',
+     '        return existing, "unreadable"    # 变异: v2.3.34 的老行为(这一轮不写回)'),
+    ("M115", "三态压回同一个键 (skip 与 zero 同权: 截断时先扔掉\"未知\"节点)",
+     "xbox-speedtest.py", "C91",
+     """    if ip in skip:
+        return (20, 0.0, 0)""",
+     """    if ip in skip:
+        return (30, 0.0, 0)   # 变异: 与"测了 0"同权"""),
+    ("M116", "极差吃 0 值 (把\"一轮没测出来\"说成\"抖动\", 而两者处置方向相反)",
+     "xbox-speedtest.py", "C92",
+     '    lo, hi = (min(good), max(good)) if good else (0.0, 0.0)',
+     '    lo, hi = min(rs), max(rs)   # 变异: 极差含 0, 与中位数口径不一'),
+
+    # M117-M119 打 v2.3.36。M117 属于"把事实说错"那一类: 代码看着还能跑, 但逐 IP 的 wave 一旦
+    # 只剩一个 max, "同节点跨档位分数变不变"就真的永远测不出来了 —— 而账上正挂着"4 路分摊"。
+    ("M117", "screen_wave 只存一个 max (回退成『不是逐 IP』, 4 路分摊就真的测不了了)",
+     "xbox-speedtest.py", "C93",
+     '        "screen_wave": dict((k, v) for k, v in (screen_wave or {}).items() if v is not None),',
+     '        "screen_wave": {"_max": max((screen_wave or {}).values() or [0])},   # 变异: 丢掉逐 IP'),
+    ("M118", "status 不区分 created / created_after_writefail (上一轮写失败与首次部署同形)",
+     "xbox-speedtest.py", "C86b",
+     '        status = "created_after_writefail" if os.path.exists(seen_path) else "created"',
+     '        status = "created"      # 变异: 与首次部署同形'),
+    ("M119", "隔离文件不再加序号 (同一秒两次隔离, 前一份坏证据被覆盖)",
+     "xbox-speedtest.py", "C94",
+     '''        _bak, _n = _base_bak, 1
+        while os.path.exists(_bak):
+            _bak = "%s-%d" % (_base_bak, _n)
+            _n += 1''',
+     '''        _bak = _base_bak       # 变异: 同秒覆盖前一份坏证据'''),
 ]
 
 

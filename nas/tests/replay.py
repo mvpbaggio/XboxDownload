@@ -33,10 +33,17 @@ v2.3.32(审查方 P3-F): 无参数运行时原来 `new_ratio = None`, 于是翻�
 另外 `WIN_RATIO` 里 Cn1 的现行值恰好也是 1.15, 与最常输的假设值撞号 —— 那种情况下
 "翻转 0 轮"不是"Cn1 不受影响", 而是"1.15 比 1.15", 所以下面会**明说**这句。
 
-v2.3.33: `screen_capped` 这一列的空**不再是一句话**。撞顶线是**每路**的(8MiB/0.1s=80MiB/s),
-4 路并发下每路只有 20 —— 结构性撞不到, 所以这一列在现行档位下恒空。样本里的 `screen_cap`
-就是那个理由: 有它 => "撞顶 0 行是这一档撞不到"; 没有它 => "旧版没记, 无法区分"。
-不要拿 v2.3.32 及更早的样本读"Cn1 节点都没到 80"—— 那批样本证明不了这件事。
+v2.3.33: `screen_capped` 这一列的空**不再是一句话**。当时以为"撞顶线随并发摊薄"(4 路 => 20MiB/s),
+于是记 `screen_cap = 80/max(wave)`。
+
+v2.3.34: **上面那句是错的, 已推翻**。撞顶线恒 = 80MiB/s(每路, 8MiB/0.1s), **与并发无关**;
+并发改变的只是"够不够得着"它 —— 4 路满编时要有一路跑到 80, 出口总带宽得有 80×4 = 320MiB/s。
+`80/max(wave)` 算的是"出口被均分时每路分到多少", 只有当出口被打满时才等于观察值。
+真机自证(2026-11-08 04:00, Cn1): 48 个分数里 **41 个 > 20.0** 而 `screen_capped` 是空的 ——
+一个分数不可能超过自己的撞顶线, 所以 20.0 从来不是那条线。
+现在样本里是两个量: `screen_floor`(=80.0, 恒) 与 `screen_need`(=80×max(wave), 达到它所需出口)。
+判读方法: `max(screen) × max(wave)` 是出口下界, 小于 `screen_need` => 撞不到是**结构性的**。
+旧样本只有 `screen_cap`: 那一列按旧口径确实违反"分数 <= 上限", 不要拿它读任何东西。
 """
 import json
 import os
@@ -59,10 +66,16 @@ DEFAULT_RATIO = 1.15
 # quick 里缺席的键到底是"预算跳过"还是"测了是 0"分不清。
 # v2.3.32 补 screen_skip / screen_zero / screen_wave: 前两个是 quick_skip 在粗筛侧的对称
 # (审查方 P1-B: 同一个论证写两遍, 漏了粗筛那一遍), 第三个是分数"被几路平分过"的唯一凭证。
-# v2.3.33 补 screen_cap: 撞顶线是**每路**的(80/wave), 没有它 "capped 空" 与 "capped 真为空" 同形。
+# v2.3.33 补 screen_cap —— 那一版的口径是错的(80/max(wave)), v2.3.34 已拆成下面两个:
+#   screen_floor 撞顶线本身(80.0, 与并发无关)  screen_need 达到它所需的出口总带宽(80×wave)
+# 旧样本只有 screen_cap: 保留读取能力(判读那一段会点名叫你别用), 但它**不在 WANTED 里**了 ——
+# 新样本不该再出现这个名字, 否则说明拆得不干净。
+# v2.3.34 补 t_screen / t_quick: 原来三段耗时只由 `[t]` 那行打给人看, 落盘前被 pop 掉,
+# 3405s 一轮事后算不出"哪一段在变慢"; 而 t_l0 写进每一行却从没被正文读过。
 WANTED = ("ts", "group", "l0", "l0_tail", "l0_pool", "l0_probed", "l0_alive",
-          "screen", "screen_capped", "screen_skip", "screen_zero", "screen_wave", "screen_cap",
-          "quick", "quick_skip", "t_l0",
+          "screen", "screen_capped", "screen_skip", "screen_zero", "screen_wave",
+          "screen_floor", "screen_need",
+          "quick", "quick_skip", "t_l0", "t_screen", "t_quick",
           "cur", "wr", "st_cur", "st_cand", "q_cur", "ip", "speed", "decision")
 
 
@@ -113,16 +126,43 @@ def main(argv):
 
     # ---- 2. screen 撞顶比例: 80.0 是"测出来"还是"至少" ----
     capped_rows = sum(1 for r in rows if r.get("screen_capped"))
-    # v2.3.33: 撞顶线是**每路**的, 所以"0 行有撞顶"这句话在没有 screen_cap 时无法解释 ——
-    # 4 路并发下每路只有 20MiB/s 的线, 结构上撞不到; 串行才是 80。两种"空"必须分开。
-    caps = [r.get("screen_cap") for r in rows if r.get("screen_cap")]
+    # v2.3.34: 撞顶线恒 80(每路), 与并发无关。并发只决定"够不够得着": 4 路要 320MiB/s 出口。
+    # 判据用**观测值反推** —— max(分数)×wave 是出口下界, 小于 need 就撞不到。这里没有"均分"假设:
+    # 均分只在出口被打满时成立, 而真机实测 max(分数) = 73.2 远超 80/4 = 20, 恰恰证明没打满。
+    floors = [r.get("screen_floor") for r in rows if r.get("screen_floor")]
+    needs = [r.get("screen_need") for r in rows if r.get("screen_need")]
+    caps_old = [r.get("screen_cap") for r in rows if r.get("screen_cap")]
     print("\n[screen] %d/%d 行有撞顶节点(值只是下界, 名次由 L0 握手时间决定)" % (capped_rows, len(rows)))
     if capped_rows == 0:
-        if caps:
-            print("[screen] 撞顶 0 行**有理由**: 本轮单路撞顶线 %s MiB/s(4 路是 80/4=20, 串行才是 80); "
-                  "这一档撞不到 ≠ 节点没到 80" % sorted(set(caps)))
+        if floors:
+            print("[screen] 撞顶线 %s MiB/s(每路, 与并发无关); 达到它所需出口 %s MiB/s"
+                  % (sorted(set(floors)), sorted(set(needs)) or "?"))
+            _shown = 0
+            for _r in rows:
+                _fl, _nd = _r.get("screen_floor"), _r.get("screen_need")
+                _sc, _wv = _r.get("screen") or [], _r.get("screen_wave") or {}
+                _w = [v for v in _wv.values() if isinstance(v, int)]
+                if not (_fl and _nd and _sc and _w):
+                    continue
+                _wmax, _mx = max(_w), max(float(x[0]) for x in _sc)
+                _rev = _mx * _wmax
+                if _rev < _nd:
+                    print("[screen] %s %s: 最高单路 %.1f × %d 路 => 出口至少 %.0f < need %.0f "
+                          "⇒ 撞不到是**结构性**的, 与'真没人撞'无关"
+                          % (_r.get("ts"), _r.get("group"), _mx, _wmax, _rev, _nd))
+                else:
+                    print("[screen] %s %s: 最高单路 %.1f × %d 路 => 出口至少 %.0f >= need %.0f "
+                          "⇒ 本该出现 capped 却没有, 先去查计时器而不是节点"
+                          % (_r.get("ts"), _r.get("group"), _mx, _wmax, _rev, _nd))
+                _shown += 1
+                if _shown >= 8:      # 一行一组, 别把 30 天的样本全打出来
+                    break
+        elif caps_old:
+            print("[screen] 撞顶 0 行, 样本带的是 **screen_cap=%s** —— 那是 v2.3.33 的错误口径"
+                  "(80/并发), 别拿它读任何东西: 真机 41/48 个分数都超过了它。重新跑一轮才有 floor/need"
+                  % sorted(set(caps_old)))
         else:
-            print("[screen] 撞顶 0 行但样本没有 screen_cap —— 无法区分「这一档撞不到」与「真没人撞」"
+            print("[screen] 撞顶 0 行且样本没有任何撞顶线字段 —— 无法区分「这一档撞不到」与「真没人撞」"
                   "(v2.3.32 及更早的样本就是这个状态)")
     skipped = sum(len(r.get("quick_skip") or []) for r in rows)
     print("[quick] 累计预算跳过 %d 个候选(这些在 quick 里根本没有键, 与'测了是 0'不同)" % skipped)
@@ -132,9 +172,69 @@ def main(argv):
           % (s_skip, s_zero))
     waves = [v for r in rows for v in (r.get("screen_wave") or {}).values() if isinstance(v, int)]
     if waves:
-        # 8MiB 的读数是"被几路平分之后"的数: 同一节点在 wave=1 和 wave=4 下本来就不该同分。
-        print("[screen] 并发档位 %s(分数只在同档位之间可比; wave 越大, 每路分到的带宽越少)"
+        # v2.3.34: 不再说"被几路平分"。同节点跨轮分数会变, 但原因**未必是**分摊 —— 只有当
+        # 出口被打满时才平分。这一列只是"进场那一刻几路在跑", 用于归因而非折算。
+        print("[screen] 并发档位 %s(进场时刻同批请求数; 分数要跨档位比, 请先看下面的出口下界)"
               % dict((w, waves.count(w)) for w in sorted(set(waves))))
+
+    # ---- 2c. 分数 vs 并发档位(观测, 不判定) ----
+    # v2.3.36 (审查方 M1): v2.3.35 我在三处写了"逐 IP 的 wave 没入库", 那是**事实错误** ——
+    # `screen_wave` 一直是 {ip: 进场时同批几路} 逐 IP 落盘的(build_sample), 上面 143 行本来就
+    # 把它和 `screen` 配对取出来了(只是只拿了 max 去算出口下界, 没算逐 IP)。
+    # 真正算不出相关性的原因是**单行内 wave 常无方差**: 满编时 48 个 IP 的 wave 全是 4, 相关
+    # 系数必然除零; 必须跨行/跨档位攒。这两句话方向相反 ——
+    #   "没入库"     = 结构上永远不可能 -> 账上"4 路分摊"会被判成不可测量
+    #   "要攒档位"   = 这两周正好在收 -> 档位一多就能直接读出"同 IP 跨档位分数变不变"
+    # 所以这里按 wave 分档打中位数/极差, 并对"出现在 >=2 个档位的 IP"做同 IP 对照。
+    _pw = {}
+    _by_ip = {}
+    for _r in rows:
+        _wv = _r.get("screen_wave") or {}
+        for _sp, _ip in (_r.get("screen") or []):
+            _w = _wv.get(_ip)
+            if not isinstance(_w, int) or _w <= 0:
+                continue
+            _pw.setdefault(_w, []).append(float(_sp))
+            _by_ip.setdefault(_ip, {}).setdefault(_w, []).append(float(_sp))
+    if _pw:
+        def _med(v):
+            v = sorted(v)
+            return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
+        print("\n[obs] 分数 vs 并发档位(跨 %d 行累积, 单行内 wave 常恒为满编所以必须跨行攒):" % len(rows))
+        for _w in sorted(_pw):
+            _v = sorted(_pw[_w])
+            print("       wave=%d  n=%-4d 中位 %5.1f  极差 %.1f~%.1f"
+                  % (_w, len(_v), _med(_v), _v[0], _v[-1]))
+        _multi = [(ip, d) for ip, d in _by_ip.items() if len(d) >= 2]
+        if _multi:
+            print("       同 IP 跨档位(直接对照『同节点分数变不变』, 前 8 个):")
+            for ip, d in sorted(_multi)[:8]:
+                print("         %-15s " % ip + "  ".join(
+                    "wave=%d 中位%5.1f(n=%d)" % (_w, _med(v), len(v)) for _w, v in sorted(d.items())))
+        else:
+            print("       还没有 IP 出现在 2 个以上档位 —— 这就是『要攒』: 攒到才有同 IP 对照，"
+                  "现在只能看档位间中位数的整体移动(含节点构成差异, 不能单独归因到并发)")
+    else:
+        print("\n[obs] 样本里没有 screen_wave 能与 screen 配对的行 —— 这一列先攒数据")
+
+    # ---- 2b. 分段耗时: 三段 P50/P90 ----
+    # v2.3.34 (审查方 P2-E): t_screen / t_quick 原来在落盘前被 pop, 3405s 一轮事后算不出
+    # "哪一段在变慢"; 而 t_l0 写进每一行、正文从没读过。三段一起看才有意义: L0 涨=池子长了,
+    # 粗筛涨=节点多/带宽挤, 快测涨=候选多或单节点慢。
+    _seg = (("t_l0", "L0 握手"), ("t_screen", "粗筛"), ("t_quick", "快测"))
+    _seg_have = False
+    for _k, _label in _seg:
+        _v = sorted(float(r[_k]) for r in rows if _num(r.get(_k)))
+        if not _v:
+            continue
+        if not _seg_have:
+            print("\n[耗时] 分段(秒); **只比同一侧的历史, 换机器后不可直接比**")
+            _seg_have = True
+        _p90 = _v[min(len(_v) - 1, int(len(_v) * 0.9))]
+        print("  %-8s P50 %.0f / P90 %.0f / max %.0f / 共 %d 轮"
+              % (_label, statistics.median(_v), _p90, _v[-1], len(_v)))
+    if not any(_num(r.get("t_screen")) for r in rows):
+        print("\n[耗时] 样本没有 t_screen/t_quick(v2.3.33 及更早) —— 只能看到 L0, 算不出哪一段在变慢")
 
     # ---- 3. 阈值灵敏度: 唯一真正要回答的那个问题 ----
     usable = [r for r in rows if _num(r.get("st_cur")) and _num(r.get("st_cand"))]
