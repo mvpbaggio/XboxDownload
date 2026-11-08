@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -136,6 +137,19 @@ FAILURE_TESTS = {
 
 RESULTS = []
 
+# 审计自己造的临时目录**全部登记**, main 收尾时删掉。这不是洁癖:
+# NAS 的 /tmp 是 3.8G 的 tmpfs, 而一次 audit 要建几十个目录(每条用例一个 BASE/沙箱),
+# 之前从不删 —— 2026-11-08 实测累积 **238819 个条目**, 3.8G 塞到 59% 之后直接把
+# selftest 卡死在 M2: `OSError: [Errno 28] No space left on device`。
+# 也就是说"审计留垃圾"的代价不是磁盘, 是**第二天自检跑不完**。
+_TMPDIRS = []
+
+
+def _mktmp(prefix="tmp", **kw):
+    d = tempfile.mkdtemp(prefix=prefix, **kw)
+    _TMPDIRS.append(d)
+    return d
+
 
 def chk(cid, title, cond, detail=""):
     cond = bool(cond)
@@ -223,23 +237,83 @@ def capture(fn, *a, **kw):
     return r, buf.getvalue()
 
 
+def _replay(d, rows):
+    """合成样本 -> 临时 jsonl -> **被审目录里**那份 replay.py, 返回 (返回码, 输出)。
+
+    七条用例(C93/95/96/97/99/100/101)原来各自手抄这一段; 其中两件事已经各咬过一次,
+    收进一个函数才不会咬第三次:
+      - 路径必须**先从 `d` 取** —— 变异目录里那份才是被审对象。首版写死 `dirname(__file__)`,
+        于是 M120 注入后仍跑去跑真身, 全绿;
+      - 子进程 stdout 编码必须显式 utf-8: 管道下 Python 用 locale(Windows=cp936), 中文断言串
+        变乱码, 而失败信息只会说"找不到"。
+    """
+    _p = os.path.join(_mktmp(prefix="smp_"), "samples.jsonl")
+    with open(_p, "w", encoding="utf-8") as _f:
+        _f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    _rp = os.path.join(d, "tests", "replay.py")
+    if not os.path.isfile(_rp):
+        _rp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay.py")
+    _env = dict(os.environ)
+    _env["PYTHONIOENCODING"] = "utf-8"
+    _pr = subprocess.run([sys.executable, _rp, "1.15", _p], env=_env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return _pr.returncode, _pr.stdout.decode("utf-8", "replace")
+
+
+def _probe(d, cells, ns="1", recall_w=None):
+    """合成格 -> 临时 jsonl -> **被审目录里**那份 exp_screen_workers.py, 返回 (返回码, 输出)。
+
+    与 `_replay` 同一套理由(路径先从 `d` 取; stdout 显式 utf-8), 另加一条**只在这里**成立的:
+    `--dir d` 必须显式传 —— 探针要加载主程序那四个常量(SCREEN_CHUNK / SCREEN_N /
+    MAX_QUICK_CANDS / RTT_TOP)。不传就默认到"本文件上一级", 变异目录里它拉到的就是**真身**,
+    和 C95 首版是同一个坑("跑错那一份"), 只是这次跨的是目录而不是文件。
+    """
+    _p = os.path.join(_mktmp(prefix="exp_"), "cells.jsonl")
+    with open(_p, "w", encoding="utf-8") as _f:
+        _f.write("".join(json.dumps(c, ensure_ascii=False) + "\n" for c in cells))
+    _ep = os.path.join(d, "tests", "exp_screen_workers.py")
+    if not os.path.isfile(_ep):
+        _ep = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "exp_screen_workers.py")
+    _cmd = [sys.executable, _ep, "--dir", d, "--from-json", _p, "--screen-n", ns]
+    if recall_w is not None:
+        _cmd += ["--recall-w", str(recall_w)]
+    _env = dict(os.environ)
+    _env["PYTHONIOENCODING"] = "utf-8"
+    _pr = subprocess.run(_cmd, env=_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return _pr.returncode, _pr.stdout.decode("utf-8", "replace")
+
+
 # 运行产物(只在真机上生成, 不进仓库): 审计不许碰其中任何一个字节。
 # 2026-11-07 实测: v2.3.28 把 samples.jsonl 路径写成模块常量, 一次 audit 通过 st_run 跑 38 次 main,
 # 每次都往**真**文件 append 一行夹具样本(9.9.9.9 / 1.0ms) —— 39 行里只有 1 行是真机测出来的。
 # 靠人眼盯「哪些用例改了 BASE」不成立(同类路径还有 results/speed.log/.last_retest/run.log),
 # 所以这里改成事后对账: 跑前跑后各拍一次 (size, mtime_ns, md5), 不讲道理、只讲事实。
-RUN_PRODUCTS = ("samples.jsonl", "results.json", "speed.log", ".last_retest", "run.log")
+RUN_PRODUCTS = ("samples.jsonl", "results.json", "results.json.seen", "speed.log", ".last_retest", "run.log")
+# v2.3.37 (审查方 P3-4): 隔离文件是**动态名字**(`results.json.corrupt-<ts>[-n]`), 进不了上面的元组;
+# 而它同样是"只在真机上出现、审计不许造"的持久态 —— 守卫集合没跟着长, 就是"新加了一个持久态,
+# 而守卫只认旧清单"。前缀扫描比什么也不做贵三行。
+RUN_PRODUCT_PREFIXES = ("results.json.corrupt-",)
 
 
 def run_products_state(d):
     st = {}
-    for n in RUN_PRODUCTS:
+    names = list(RUN_PRODUCTS)
+    try:
+        names += [n for n in sorted(os.listdir(d))
+                  if any(n.startswith(p) for p in RUN_PRODUCT_PREFIXES)]
+    except OSError:
+        pass
+    for n in names:
         p = os.path.join(d, n)
         try:
             with open(p, "rb") as f:
-                blob = f.read()
+                # v2.3.38 (审查方观察项): 原来整文件读进来做 md5。`corrupt-*` 隔离文件永不清理
+                # (M3 观察项), 数量只会线性长; `samples.jsonl` 30 天也会到几十 MB。判"审计有没有
+                # 动它"不需要全文: 任何写入都改 size 或 mtime_ns, 或在**这一段**里改字节。
+                blob = f.read(1 << 20)
             s = os.stat(p)
-            st[n] = (len(blob), s.st_mtime_ns, hashlib.md5(blob).hexdigest())
+            st[n] = (s.st_size, s.st_mtime_ns, hashlib.md5(blob).hexdigest())
         except OSError:
             st[n] = None       # 不存在也算一种状态: 审计把它造出来同样是污染
     return st
@@ -465,7 +539,11 @@ def audit_static(d):
     # 但它判断"这是固有代价"—— 不, 台账那边早就用"只扫头部"解决过同一个问题了。
     # 边界靠标题定位, 所以 A20 盯住那个标题还在(被改名不会报错, 只会让 A19 静默退回扫全文)。
     EXT_IDS = set()     # 外部编号若出现在**当前状态区**(不是历史区)才加这里; 目前为空 = 扫描面里每个编号都真存在
-    _real_ids = set(re.findall(r'chk\(\s*"([A-D]\d{1,2}[a-z]?)"', _selfsrc))
+    # v2.3.39: 编号位数从 `\d{1,2}` 放宽到 `\d{1,3}` —— 这一版第一次出现三位编号(C100/C101), 而
+    # **两处正则都还卡在两位**: `_real_ids` 认不出它们(于是真实存在也被当不存在), 扫描侧也匹配不上
+    # (于是文档里写一个**不存在**的 `C199` 照样全绿)。实测: 把台账头部那句 A18 换成 C199, 审计
+    # 175 项全绿 —— A19 对三位编号是**瞎的**, 两个方向同时失效, 所以它自己没报「假账」。
+    _real_ids = set(re.findall(r'chk\(\s*"([A-D]\d{1,3}[a-z]?)"', _selfsrc))
     # 段兜底是 chk(cid, ...) 动态传的: A0/B0/C0/D0 在源码里**真实存在**(段调度元组),
     # 但字面量正则看不见 —— 于是文档里如实写"任何一段崩了由 C0 兜住"会被判成假账。
     # 真话被判红和假账被放过是同一个病的两面, 都要堵。模式限定为 "X9") 形态(元组末尾),
@@ -502,7 +580,7 @@ def audit_static(d):
         _targets.append((os.path.basename(_p), _t if _i < 0 else _t[:_i]))
     for _name, _txt in _targets:
         for _ln, _line in enumerate(_txt.splitlines(), 1):
-            for _id in re.findall(r"(?<![0-9A-Za-z_])([A-D]\d{1,2}[a-z]?)(?![0-9A-Za-z_])", _line):
+            for _id in re.findall(r"(?<![0-9A-Za-z_])([A-D]\d{1,3}[a-z]?)(?![0-9A-Za-z_])", _line):
                 if _id not in _real_ids and _id not in EXT_IDS:
                     _ghost.append("%s:%d -> %s" % (_name, _ln, _id))
     chk("A19", "文档点名的检查编号都真实存在(引用假账: 头部写 C66, 实际叫 A18); 只扫当前状态区",
@@ -549,6 +627,9 @@ def audit_static(d):
                    ("pool_refresh.py", os.path.join(d, "pool_refresh.py")),
                    ("tests/audit.py", os.path.abspath(__file__)),
                    ("tests/replay.py", os.path.join(_self_dir, "replay.py")),
+                   # v2.3.39 第三十八轮: 对照实验探针也在 NAS 侧执行(3.8.10), 同一把尺子量。
+                   ("tests/exp_screen_workers.py",
+                    os.path.join(_self_dir, "exp_screen_workers.py")),
                    ("tests/selftest_audit.py", _py38_st)):
         if not os.path.isfile(_p):
             _py38_bad.append("%s: 文件不存在" % _f)
@@ -947,7 +1028,7 @@ def audit_behaviour(d):
     # 变成同一个 None -> 整轮 return, 日志说"ssh 不可达"。换新路由器/配置被清空后永久空转。
     def run_xs_main(current_value):
         x = load(xs_p, "xst61")
-        x.BASE = tempfile.mkdtemp()
+        x.BASE = _mktmp()
         x.POOLS = []                 # 环境自检段不需要真去测速
         x.test_pool = lambda *a, **k: None
         calls = []
@@ -977,7 +1058,7 @@ def audit_behaviour(d):
     # ---- C3..C6 热备止血 ----
     def wd_fresh(hist, hotspares, steady_map, apply_result=None):
         m = load(wd_p, "wd")
-        m.BASE = tempfile.mkdtemp()
+        m.BASE = _mktmp()
         rec = []
 
         def router_cmd(cmd):
@@ -1070,7 +1151,7 @@ def audit_behaviour(d):
         str(m.parse_hist(hist2)))
 
     # ---- C13 落盘读取容错 ----
-    tmp = tempfile.mkdtemp()
+    tmp = _mktmp()
     m = load(wd_p, "wd")
     m.BASE = tmp
     open(os.path.join(tmp, "results.json"), "w", encoding="utf-8").write("{坏json")
@@ -1087,7 +1168,7 @@ def audit_behaviour(d):
     # 真握手要打外网(RFC5737 会吃满 RTT_TRIES×RTT_TIMEOUT), 而这里要验的是"test_pool 拿谁去粗筛"。
     def st_env(rows, regions=("广东", "广西"), screen=None, rtt=None):
         x = load(xs_p, "xst")
-        x.BASE = tempfile.mkdtemp()
+        x.BASE = _mktmp()
         x.SCREEN_REGIONS = regions
         p = os.path.join(x.BASE, "pool.txt")
         with open(p, "w", encoding="utf-8") as f:
@@ -1316,7 +1397,7 @@ def audit_behaviour(d):
     def st_run(ranked, quick_map, steady_map, hist=hist_cn1, argv=("--pool", "Cn1"), seed=None,
                apply_fail=False, calls=None, pre=None):
         x = load(xs_p, "xst")
-        x.BASE = tempfile.mkdtemp()
+        x.BASE = _mktmp()
         if seed is not None:
             json.dump(seed, open(os.path.join(x.BASE, "results.json"), "w", encoding="utf-8"))
         pth = os.path.join(x.BASE, "pool.txt")
@@ -1399,7 +1480,7 @@ def audit_behaviour(d):
     # 快测预算一用尽, 第一个被 break 跳过的正是它 -> results(只留 sp>0)里没有它 ->
     # main 把"根本没测"读成"测了是 0" = 判死。用 QUICK_BUDGET_SEC=0 把"预算刚好用完"这一态钉住。
     x5 = load(xs_p, "xst5")
-    pth5 = os.path.join(tempfile.mkdtemp(), "p5.txt")
+    pth5 = os.path.join(_mktmp(), "p5.txt")
     with open(pth5, "w", encoding="utf-8") as f:
         f.write("1.1.1.1\t(广东 电信)\n2.2.2.2\t(广东 移动)\n3.3.3.3\t(广东 联通)\n")
     x5.load_ips = lambda p: [("1.1.1.1", "(广东 电信)"), ("2.2.2.2", "(广东 移动)"),
@@ -1587,7 +1668,7 @@ def audit_behaviour(d):
 
     # 空 A 回答(dlassets2 会间歇性只给 CNAME)与查询失败必须区分: 前者这次跳过, 后者说明 DoH 出口坏了
     pr2 = load(os.path.join(d, "pool_refresh.py"), "pr47")
-    base47 = tempfile.mkdtemp()
+    base47 = _mktmp()
     with open(os.path.join(base47, "IP.XboxCn1.txt"), "w", encoding="utf-8") as f:
         f.write("1.1.1.1\t(既有 广东 电信)\n")
 
@@ -1612,7 +1693,7 @@ def audit_behaviour(d):
     # 写进池子之后下游三处全拿它当节点: load_ips 的正则认点分、粗筛白等一个超时、稳态 0 被读成
     # "节点已死"; 最坏被 router_apply 钉进 dnsmasq —— 那一步的后果不是"慢", 是整组断网。
     pr66 = load(os.path.join(d, "pool_refresh.py"), "pr66")
-    base66 = tempfile.mkdtemp()
+    base66 = _mktmp()
     with open(os.path.join(base66, "IP.XboxCn1.txt"), "w", encoding="utf-8") as f:
         f.write("1.1.1.1\t(既有 广东 电信)\n")
     junk66 = ["0.0.0.0", "127.0.0.1", "192.168.1.1", "10.1.2.3", "100.64.0.9",
@@ -1632,7 +1713,7 @@ def audit_behaviour(d):
     def wd_run(mark_age):
         """mark_age=None 表示没有标记文件; 负数表示标记时间在未来"""
         m = load(wd_p, "wd48")
-        m.BASE = tempfile.mkdtemp()
+        m.BASE = _mktmp()
         if mark_age is not None:
             with open(os.path.join(m.BASE, m.RETEST_MARK_NAME), "w", encoding="utf-8") as f:
                 f.write("%d\n" % int(time.time() - mark_age))
@@ -1688,7 +1769,7 @@ def audit_behaviour(d):
         0 <= age49 < 300, "标记 age=%.0fs 存在=%s" % (age49, os.path.exists(mp49)))
 
     x49c = load(xs_p, "xst49c")
-    x49c.BASE = os.path.join(tempfile.mkdtemp(), "不存在", "不可写")
+    x49c.BASE = os.path.join(_mktmp(), "不存在", "不可写")
     try:
         capture(x49c.mark_retest)
         err49 = ""
@@ -1753,7 +1834,7 @@ def audit_behaviour(d):
             "watchdog=%s speedtest=%s" % ('".run.lock"' in wd_src, '".run.lock"' in xs_src))
     else:
         w53 = load(wd_p, "wd53")
-        w53.BASE = tempfile.mkdtemp()
+        w53.BASE = _mktmp()
         hold53 = open(os.path.join(w53.BASE, ".run.lock"), "w")
         _fc53.flock(hold53, _fc53.LOCK_EX | _fc53.LOCK_NB)
         busy53 = w53.run_lock_taken()          # 同一个文件的另一个 fd: 必须返回 False
@@ -1798,7 +1879,7 @@ def audit_behaviour(d):
             "wd_src 缺 LOCK_ERR 定义/字面量/return")
     else:
         w55 = load(wd_p, "wd55")
-        d55 = tempfile.mkdtemp()
+        d55 = _mktmp()
         os.makedirs(os.path.join(d55, ".run.lock"))     # 同名目录 -> open(...,"w") 必然失败(root 也一样)
         w55.BASE = d55
         r55 = w55.run_lock_taken()
@@ -1818,7 +1899,7 @@ def audit_behaviour(d):
     # 一直错到 09:37 那次手动全量。没有那次手动, 会错到明早 04:00(最长 19.5 小时)。
     # speed 必须写这一刀的实测值, 不能写名单里的旧记录 —— 记旧值会让基准虚高, 又变回"每小时 degraded"。
     w56 = load(wd_p, "wd56")
-    w56.BASE = tempfile.mkdtemp()
+    w56.BASE = _mktmp()
     seed56 = [{"group": "Cn1", "ip": "1.2.3.4", "speed": 40.0, "router": "kept",
                "hotspares": [{"ip": "1.2.3.4", "steady": 99.0}, {"ip": "7.7.7.7", "steady": 98.0}]},
               {"group": "Cn2", "ip": "5.6.7.8", "speed": 88.0, "router": "kept", "hotspares": []}]
@@ -1846,7 +1927,7 @@ def audit_behaviour(d):
                                          g56["Cn1"]["hotspares"]))
 
     w56b = load(wd_p, "wd56b")
-    w56b.BASE = tempfile.mkdtemp()
+    w56b.BASE = _mktmp()
     no56 = w56b.record_pin("Cn1", "7.7.7.7", 100.0)
     chk("C56b", "results.json 缺失/没有该组时 record_pin 返回 False 且不造文件(记账失败不拖垮止血)",
         no56 is False and not os.path.exists(os.path.join(w56b.BASE, "results.json")),
@@ -1896,7 +1977,7 @@ def audit_behaviour(d):
     # mark_retest 原来紧跟拿锁之后, 而路由器可达性检查在十几行后: 路由器瞬断一次 -> 3 小时内不重测,
     # 而那恰恰是最该立刻重试的时刻。断言看的是"标记文件有没有被创建"(行为), 不是"哪一行在前"(语法)。
     x60 = load(xs_p, "xst60")
-    x60.BASE = tempfile.mkdtemp()
+    x60.BASE = _mktmp()
     x60.router_cmd = lambda cmd: None           # ssh 不通
     old60 = sys.argv
     sys.argv = ["xbox-speedtest.py", "--pool", "Cn1"]
@@ -1914,7 +1995,7 @@ def audit_behaviour(d):
     # 白烧; 更糟的是**进热备名单的是第二次那个值**。Cn2 单次抖动能到 4 倍(v2.3.8 ⑩), 第二次返回 0
     # 时, 刚测到 95.7 的冠军直接低于 min_steady 被过滤, 名单静默少一个人还没人报警。
     x8 = load(xs_p, "xst8")
-    x8.BASE = tempfile.mkdtemp()
+    x8.BASE = _mktmp()
     pth8 = os.path.join(x8.BASE, "p8.txt")
     with open(pth8, "w", encoding="utf-8") as f:
         f.write("9.9.9.9\t(广东 电信)\n1.1.1.1\t(广东 移动)\n2.2.2.2\t(广东 联通)\n3.3.3.3\t(湖北 电信)\n")
@@ -1981,7 +2062,7 @@ def audit_behaviour(d):
 
     # ---- C23 watchdog 死节点 => 止血 + 触发定向重测 ----
     m = load(wd_p, "wd")
-    m.BASE = tempfile.mkdtemp()
+    m.BASE = _mktmp()
     m.get_pins = lambda: {"Cn1": "9.9.9.9", "Cn2": "8.8.8.8"}
     m.steady = lambda ip, host=None, path=None: 0.0 if ip == "9.9.9.9" else 100.0
     m.load_hotspares = lambda n: [{"ip": "7.7.7.7", "steady": 99}] if n == "Cn1" else []
@@ -2017,7 +2098,7 @@ def audit_behaviour(d):
         "错标签=%s 名单=%s" % (bad, [o["ip"] for o in out_u]))
 
     # ---- C26 劣化基准必须跟着"路由器此刻钉的 IP"走 ----
-    tmp2 = tempfile.mkdtemp()
+    tmp2 = _mktmp()
     w = load(wd_p, "wd")
     w.BASE = tmp2
     json.dump([{"group": "Cn1", "ip": "9.9.9.9", "speed": 108.0,
@@ -2278,7 +2359,7 @@ def audit_behaviour(d):
     # `classify` 里 `rec >= DEGRADE_MIN_RECORD` 对 0 永假 —— results.json 缺失/损坏时
     # degraded 档**永久失效**且原先零日志, 运维看到的"最近很稳"是假的。这条钉"必须打一行"。
     wm4 = load(os.path.join(d, "watchdog.py"), "wdm_c65")
-    wm4.BASE = tempfile.mkdtemp()          # 空目录: 里面没有 results.json
+    wm4.BASE = _mktmp()          # 空目录: 里面没有 results.json
     _v65, out65 = capture(lambda: wm4.load_record("Cn1", "1.2.3.4"))
     chk("C65", "results.json 读不出 => 返回 0.0 且必须打 [record] 行(degraded 失效不能静默)",
         _v65 == 0.0 and "[record]" in out65 and "degraded" in out65,
@@ -2369,7 +2450,7 @@ def audit_behaviour(d):
     # 用真实临时文件跑, 不数文本: M82("a" 改 "w")那种缺陷不报错, 只会让昨天那行安静消失 ——
     # 而文本断言恰好在有人把 open 换个写法(变量、别名函数)时无能为力。
     x72 = load(os.path.join(d, "xbox-speedtest.py"), "xst72")
-    _tmp72 = tempfile.mkdtemp(prefix="smp72_")
+    _tmp72 = _mktmp(prefix="smp72_")
     # v2.3.29: 重定向 BASE, 不是重定向一个 SAMPLES 常量 —— 落盘路径必须由被测代码自己现拼。
     # 若有人把路径改回模块常量, 这条会写进真目录(而且 A26 会当场点名)。
     x72.BASE = _tmp72
@@ -2484,7 +2565,7 @@ def audit_behaviour(d):
     # 审查方 P3-6 实测: load_ips 收下 1.2.3.4.5 / 0.0.0.0 / 192.168.1.9。前两个只是白等超时,
     # 192.168.x 会被钉进 dnsmasq —— 那一步的后果不是"慢", 是整组断网。
     x75 = load(os.path.join(d, "xbox-speedtest.py"), "xst75")
-    _t75 = tempfile.mkdtemp(prefix="pool75_")
+    _t75 = _mktmp(prefix="pool75_")
     _p75 = os.path.join(_t75, "IP.XboxCn1.txt")
     with open(_p75, "w", encoding="utf-8") as _fh:
         _fh.write("1.2.3.4.5 (畸形)\n0.0.0.0 (本网络)\n192.168.1.9 (内网)\n"
@@ -2631,7 +2712,7 @@ def audit_behaviour(d):
     # 不带参数跑一遍, 翻转恒为 0(拿旧门槛比自己), 它只打一张字段完整率。
     # **提示是对的, 默认是错的**: 一个"回放器"不带参数就不回放, 等于它证明不了任何事。
     # 这里用一行**会翻转**的夹具: Cn2 wr=1.30 现行保持, 1.15 会换 —— 无参数必须打出"翻转 1 轮"。
-    _tmp81 = tempfile.mkdtemp()
+    _tmp81 = _mktmp()
     _p81 = os.path.join(_tmp81, "samples.jsonl")
     with open(_p81, "w", encoding="utf-8") as _fh:
         _fh.write(json.dumps({"ts": "2026-11-08T00:00:00", "group": "Cn2", "cur": "1.1.1.1",
@@ -2712,7 +2793,7 @@ def audit_behaviour(d):
     # `_floor_line = SPEED_CEIL_MIB / _wave_max`(v2.3.33 的真实缺陷), 样本会记 20.0, 于是
     # "分数超过自己的上限"又回来了, 而 C82 仍绿。两条必须都有。
     x84 = load(os.path.join(d, "xbox-speedtest.py"), "xst84")
-    _p84 = os.path.join(tempfile.mkdtemp(), "p84.txt")
+    _p84 = os.path.join(_mktmp(), "p84.txt")
     with open(_p84, "w", encoding="utf-8") as f:
         f.write("1.1.1.1\t(广东 电信)\n2.2.2.2\t(广东 移动)\n")
     x84.load_ips = lambda p: [("1.1.1.1", "(广东 电信)"), ("2.2.2.2", "(广东 移动)")]
@@ -2743,6 +2824,22 @@ def audit_behaviour(d):
     # 41 个 > screen_cap(20.0), 而 screen_capped 是空的。那不是"数据坏了", 是 20.0 从来没当过撞顶线。
     # 只判**新格式**(有 screen_floor 的行): v2.3.33 及更早的行只有 screen_cap, 按旧口径确实违反,
     # 历史数据不改写, 但新样本必须满足 —— 否则下一个人会照旧读反。
+    def _dicts85(path):
+        """samples.jsonl -> [dict]。坏行与非 dict 行静默跳过 —— 这里读的是**观测**, 判定在 C85 的
+        args 里。三个消费者(不变式 / 档位分布 / W 与 need 分布)原来各抄一遍 json.loads,
+        抄第三遍的时候就是该收成一个函数的时候。"""
+        if not os.path.isfile(path):
+            return []
+        _out = []
+        for _ln in open(path, encoding="utf-8"):
+            try:
+                _o = json.loads(_ln)
+            except ValueError:
+                continue
+            if isinstance(_o, dict):
+                _out.append(_o)
+        return _out
+
     def _scan85(path):
         """扫一个 samples.jsonl: 返回 (新格式行数, 旧格式行数, 违反列表, 文件在否, 最高分, 最低分)。"""
         if not os.path.isfile(path):
@@ -2750,16 +2847,7 @@ def audit_behaviour(d):
         _n = _no = 0
         _bad = []
         _mx = _mn = 0.0
-        for _ln in open(path, encoding="utf-8"):
-            _ln = _ln.strip()
-            if not _ln:
-                continue
-            try:
-                _r = json.loads(_ln)
-            except Exception:
-                continue
-            if not isinstance(_r, dict):
-                continue
+        for _r in _dicts85(path):
             if "screen_floor" not in _r:
                 if "screen_cap" in _r:
                     _no += 1
@@ -2783,7 +2871,7 @@ def audit_behaviour(d):
     # samples.jsonl)就是空过, 只打出"新格式 0 行判定", 结论照样是绿的 —— 空集永远满足不变式。
     # 先喂一个**必然违反**的合成样本, 证明这条判据本身会红, 再去判真样本: 绿必须来自"判据活着
     # 且没抓到", 不能来自"没东西可判"。
-    _fx85 = os.path.join(tempfile.mkdtemp(prefix="smp85_"), "samples.jsonl")
+    _fx85 = os.path.join(_mktmp(prefix="smp85_"), "samples.jsonl")
     with open(_fx85, "w", encoding="utf-8") as _fw85:
         _fw85.write(json.dumps({"ts": "synthetic", "group": "Cn1", "screen_floor": 80.0,
                                 "screen": [[90.0, "1.1.1.1"], [20.0, "2.2.2.2"]]}) + "\n")
@@ -2799,80 +2887,107 @@ def audit_behaviour(d):
         "判据自检: 合成 2 行 -> 抓 %r (需恰好 1 条 90.0, 最高/最低 %.1f/%.1f); "
         "真样本 %d 行(最高 %.1f 最低 %.1f) / 旧格式(screen_cap) %d 行不判 -> 违反 %r"
         % ([b[2] for b in _fb85], _fmx85, _fmn85, _n85, _mx85, _mn85, _n85old, _bad85[:3]))
-    # 观测(不判定): 分数 vs 并发档位。
+    # 观测(不判定): 分数 vs **进场顺序**档位。
     # v2.3.36 (审查方 M1): 原来这里写的是"逐 IP 的 wave 没入库, 相关性算不出来", 这是**事实错误** ——
     # `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的, replay 也早就配对取出来了。
-    # 算不出相关系数只因为**单行内 wave 常无方差**(满编时 48 个 IP 全是 4), 必须跨行按档位攒。
-    # 所以这里按 wave 分档给中位数/极差: 档位一多, "同 IP 跨档位分数变不变"就能直接读出来 ——
-    # 那正是账上"4 路分摊"需要的观测, 而不是不可测量。
+    # v2.3.37 (审查方 P1-1): 但 v2.3.36 补的那句"单行内 wave 常无方差(满编 48 个全是 4), 要跨
+    # 档位攒"**也是错的**: 实测 5 行每行 `{1:1, 2:1, 3:1, 4:45}`(45/48), 且 wave<4 恒为本批最先
+    # 提交的 3 个(提交顺序 = L0 RTT 升序) —— 它编码 RTT 名次, 不是并发。所以这里只打实测分布 +
+    # **按组**分档(审查方 P2-3: 混组会让一次 --pool Cn2 的定向重测把中位数挪一次), 并明说这张表
+    # 回答不了"4 路分摊"。
+    _rows85 = _dicts85(_sp85) if _n85 else []      # 真样本只解析一次, 下面两段分布共用
     _bw = {}
+    _bg = {}
     if _n85:
-        for _ln in open(_sp85, encoding="utf-8"):
-            _ln = _ln.strip()
-            if not _ln:
-                continue
-            try:
-                _r = json.loads(_ln)
-            except Exception:
-                continue
-            if not isinstance(_r, dict) or "screen_floor" not in _r:
+        for _r in _rows85:
+            if "screen_floor" not in _r:
                 continue
             _wv = _r.get("screen_wave") or {}
+            _g = _r.get("group") or "?"
             for _sp, _ip in (_r.get("screen") or []):
                 _w = _wv.get(_ip)
                 if isinstance(_w, int) and _w > 0:
-                    _bw.setdefault(_w, []).append(float(_sp))
+                    _bw[_w] = _bw.get(_w, 0) + 1
+                    _bg.setdefault(_g, {}).setdefault(_w, []).append(float(_sp))
     if _n85 and _mn85 > 0:
         print("  [obs] 真样本 %d 行: 单路分数 %.1f ~ %.1f (floor 80.0) —— 贴 80 说明出口没被打满"
               % (_n85, _mn85, _mx85), flush=True)
-    if _bw:
-        _parts = []
-        for _w in sorted(_bw):
-            _v = sorted(_bw[_w])
-            _md = _v[len(_v) // 2] if len(_v) % 2 else (_v[len(_v) // 2 - 1] + _v[len(_v) // 2]) / 2.0
-            _parts.append("wave=%d n=%d 中位%.1f 极差%.1f~%.1f" % (_w, len(_v), _md, _v[0], _v[-1]))
-        print("  [obs] 分数 vs 并发档位(跨 %d 行累积): %s" % (_n85, " | ".join(_parts)), flush=True)
-        if len(_bw) == 1:
-            print("       只有 1 个档位 —— 不下结论(这就是『要攒』的意思: 档位一多才看得出同 IP 变不变)",
-                  flush=True)
+    # v2.3.39 (审查方 P1-A): 这行原来把 `screen_need` 的分布写成"手里这批样本有几种配置" ——
+    # **need 不是配置**: 它是 80 × max(进场档位), 而 max 档的上限由"那一夜 screen_rows 有几个"
+    # 决定(只活 3 个节点时 4 路也只到档位 3 ⇒ need=240, 与"W=3 的配置"逐字同形)。所以现在
+    # 两种量分开打: `screen_workers` 是配置(样本 v2.3.39 起才记), `need` 只是派生量。
+    _bnd = {}
+    _bnw = {}
+    for _r in _rows85:
+        _bnd[_r.get("screen_need")] = _bnd.get(_r.get("screen_need"), 0) + 1
+        _bnw[_r.get("screen_workers")] = _bnw.get(_r.get("screen_workers"), 0) + 1
+    if _bnw:
+        _seen_w = sorted(k for k in _bnw if isinstance(k, (int, float)) and k > 0)
+        print("  [obs] 配置 screen_workers 分布(%s): %s —— 只有一种就说明跨并发实验还没排"
+              % ("配置指纹" if _seen_w else "尚未记录", dict(
+                  (("未记" if _k is None else _k), _v) for _k, _v in _bnw.items())), flush=True)
+    if _bnd:
+        print("  [obs] 派生量 screen_need 分布(= 80 × max 进场档位; None = 那一夜粗筛 0 个 或 "
+              "v2.3.33 及更早): %s —— **它不是配置**, 同一 W 下出现两个值说明那一夜存活节点数"
+              "不同" % dict(
+                  (("None" if _k is None else _k), _v) for _k, _v in sorted(
+                      _bnd.items(), key=lambda kv: (kv[0] is not None, kv[0] or 0))),
+              flush=True)
+    if _bg:
+        print("  [obs] 进场顺序档位分布(5 行真机实测的形状是 {1:1,2:1,3:1,4:45}: wave<4 恒为本批"
+              "最先提交的 3 个 = L0 RTT 名次前 3, **不是并发**): %s"
+              % dict((w, _bw[w]) for w in sorted(_bw)), flush=True)
+        for _g in sorted(_bg):
+            _parts = []
+            for _w in sorted(_bg[_g]):
+                _v = sorted(_bg[_g][_w])
+                _md = _v[len(_v) // 2] if len(_v) % 2 else (_v[len(_v) // 2 - 1] + _v[len(_v) // 2]) / 2.0
+                _parts.append("wave=%d n=%d 中位%.1f 极差%.1f~%.1f"
+                              % (_w, len(_v), _md, _v[0], _v[-1]))
+            print("  [obs] 分数 vs 进场顺序档位 [%s]: %s" % (_g, " | ".join(_parts)), flush=True)
+        print("       本段不分桶: 档位差 = RTT 名次差, 不能读成『分摊』。要量 4 路分摊, 看 "
+              "`tests/replay.py` 2c 的**跨 W 同 IP 对照**(它按 screen_workers 分桶), 或排一次 "
+              "SCREEN_WORKERS 取 1/2/4 的对照", flush=True)
     elif _n85:
         print("  [obs] %d 行新格式样本里没有 screen_wave 能与 screen 配对 —— 这一列先攒数据" % _n85,
               flush=True)
 
-    # ---- C93 逐 IP 的 wave **确实**入库(replay 2c 的分档观测全靠它) ----
+    # ---- C93 逐 IP 的 wave 确实入库, 且 replay 按 IP 配对并**计数**配不上的条目 ----
     # v2.3.36 (审查方 M1): v2.3.35 在三处注释里写了"逐 IP 的 wave 没入库", 是事实错误, 而且方向
     # 致命 —— "没入库" = 结构上永远不可能, 账上挂着的"4 路分摊"会被判成不可测量; 真相是数据一直
-    # 在(`screen_wave` = {ip: 进场时同批几路}), 缺的只是跨档位样本。这条把事实钉在三处:
-    #   ①build_sample 真的是按 ip 建 dict(不是只存一个 max) ②replay 有分档观测段
-    #   ③合成样本上 screen 的每个 IP 都能在 screen_wave 里配对(这正是 replay 的配对口径)
-    _s93 = open(os.path.join(d, "xbox-speedtest.py"), encoding="utf-8").read()
-    # replay.py 从**审计器同目录**读(与上面 C78 的 _rp78 同口径): 变异目录里没有 tests/
-    # (selftest 的 FILES 只复制顶层交付物), 写 `d/tests/replay.py` 会在基线就 FileNotFoundError ——
-    # 那是"自检自己坏了", 比漏网更难看出来。
-    _r93 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay.py"),
-                encoding="utf-8").read()
-    _fx93 = os.path.join(tempfile.mkdtemp(prefix="smp93_"), "samples.jsonl")
-    with open(_fx93, "w", encoding="utf-8") as _fw93:
-        _fw93.write(json.dumps({"ts": "synthetic", "group": "Cn1", "screen_floor": 80.0,
-                                "screen": [[73.2, "1.1.1.1"], [66.6, "2.2.2.2"]],
-                                "screen_wave": {"1.1.1.1": 4, "2.2.2.2": 3}}) + "\n")
-    _o93 = json.loads(open(_fx93, encoding="utf-8").readline())
-    _wv93 = _o93.get("screen_wave") or {}
-    _pair93 = all(_ip in _wv93 for _sp, _ip in _o93["screen"]) and len(_wv93) == 2
-    chk("C93", "逐 IP 的 wave 确实入库: build_sample 的 screen_wave 是 {ip: wave} 逐 IP 字典、"
-               "replay 有『分数 vs 并发档位』分档段、合成样本上 screen 的 IP 全能在 screen_wave "
-               "配对 —— 『没入库』这个说法不再成立(它会让 4 路分摊被判成不可测量)",
-        ('"screen_wave": dict(' in _s93)
-        and ("[obs] 分数 vs 并发档位" in _r93)
-        and _pair93,
-        "源码按 ip 建 dict=%r replay 分档段=%r 合成配对=%r(wave=%r)"
-        % ('"screen_wave": dict(' in _s93, "[obs] 分数 vs 并发档位" in _r93, _pair93, _wv93))
+    # 在(`screen_wave` = {ip: 进场时同批几路})。
+    # v2.3.37 (审查方 P1-1) 把这条"降级"成"字段与配对口径", 但判据本身是**恒真**的。
+    # v2.3.38 (审查方 N5) 实测: 写一个 JSON 字面量 -> 读回来 -> 断言自己写的两个 key 都在 ——
+    # 写入与断言之间没有任何生产代码经过, 对任何真实改动都返回 True。我把 `screen_wave` 改成永远
+    # 写空字典(字面量 `"screen_wave": dict(` 仍在)跑了一遍: 这条照样 PASS —— 兜住那个变异的是
+    # C82, 不是它。零信息的 `and` 项比没有更坏: 它让"钉住了"看起来有 4 个来源。
+    # 现在照 C82/C89 的做法真调 build_sample, 再把输出喂给**真 replay**:
+    #   ① 配对成功 -> 2c 的 "可配对 4 条" 必须等于 screen 条目数;
+    #   ② 故意多塞一个 screen_wave 里没有的 IP -> "配不上 1 条" 必须出现。
+    # ② 钉的是审查方 N2 后半: 原来那里静默 `continue`, 真机 383 条 screen 条目里 143 条就这么
+    # 消失了、一个字都不说 —— 老行合理, 但"合理"和"没人知道"是两件事。
+    x93 = load(os.path.join(d, "xbox-speedtest.py"), "xst93")
+    _row93 = x93.build_sample("Cn1", 1.0, [], [(10.0, "1.1.1.1"), (20.0, "2.2.2.2")], {}, {},
+                              screen_wave={"1.1.1.1": 4, "2.2.2.2": 3},
+                              screen_floor=80.0, screen_need=320.0)
+    _row93b = json.loads(json.dumps(_row93))
+    _row93b["ts"] = "synthetic-unpaired"
+    _row93b["screen"] = _row93b["screen"] + [[30.0, "9.9.9.9"]]     # wave 里**没有**它
+    _rc93, _o93 = _replay(d, [_row93, _row93b])
+    _pair93 = set(_ip for _sp, _ip in _row93["screen"]) == set(_row93["screen_wave"])
+    chk("C93", "逐 IP 的 wave 确实入库, 且 replay 按 IP 配对并**计数**配不上的条目: 真 "
+               "build_sample 的输出里 screen 的 IP 与 screen_wave 的键一致; 喂给真 replay 后 "
+               "『可配对 4 条 / 配不上 1 条』必须打出来(多塞的那 1 个 IP 只有 screen 没有 wave)",
+        _pair93 and "可配对 4 条 / 配不上 1 条" in _o93,
+        "build_sample 配对=%r rc=%s 相关行=%r"
+        % (_pair93, _rc93,
+           [l.strip() for l in _o93.splitlines() if "可配对" in l][:2]))
 
     # ---- C94 同一秒两次隔离: 两份坏证据都要在 ----
     # v2.3.36 (审查方 M3): `.corrupt-<int(ts)>` 只到秒, 同一秒内隔离两次会**覆盖前一份坏证据**。
     # 概率极低(一轮 3405s), 但坏证据被悄悄覆盖这件事事后无法发现 —— 所以加序号。
     x94 = load(os.path.join(d, "xbox-speedtest.py"), "xst94")
-    _d94 = tempfile.mkdtemp(prefix="res94_")
+    _d94 = _mktmp(prefix="res94_")
     _p94 = os.path.join(_d94, "results-dup.json")
     _s94 = [{"group": "Cn1", "ip": "9.9.9.9", "speed": 95.0}]
     _k94 = ["Cn1", "Cn2"]
@@ -2887,6 +3002,282 @@ def audit_behaviour(d):
     chk("C94", "同一秒两次隔离: 两份证据都在(文件名带序号, 内容各是当次的坏字节), 不互相覆盖",
         len(_bak94) == 2 and sorted(_txt94) == ["{坏1", "{坏2"],
         "隔离文件=%r 内容=%r" % (_bak94, _txt94))
+
+    # ---- C95 replay 2c 必须**按组**分表 ----
+    # v2.3.37 (审查方 P2-3): v2.3.36 的 2c 把 Cn1/Cn2 混进同一张表, 而 WIN_RATIO 与
+    # DEGRADE_MIN_RECORD 在别处就是按两组两个分布处理的 —— 两个不同分布的中位数没有意义,
+    # 而且一次 `--pool Cn2` 的定向重测就会把整张表的中位数挪一次。
+    # 这条用**合成样本跑真 replay**(不是 grep 字符串): Cn1 的分数恒 10.0、Cn2 恒 90.0,
+    # 只要两组还混在一起, wave=1 的中位就落到 50 附近, 断言当场红。
+    # **同一类错误的第二次**: 首版这里写的是 `os.path.dirname(__file__)/replay.py`, 即**审计器
+    # 自己旁边**那份 —— 而变异目录里的 `tests/replay.py` 才是被审对象。于是 M120(2c 混组)注入后,
+    # C95 仍然跑去跑真身, 全绿 => selftest 报"漏网 M120"。这类"跑错那一份"的坑现在是 `_replay`
+    # 里**一处**的事(先从 `d` 取, 拿不到才退回自己旁边), 不用每条用例各抄一遍。
+    _rc95, _o95 = _replay(d, [
+        {"ts": "synthetic", "group": _g95, "screen_floor": 80.0,
+         "screen": [[_v95, "1.1.1.1"], [_v95, "2.2.2.2"]],
+         "screen_wave": {"1.1.1.1": 1, "2.2.2.2": 4}}
+        for _g95, _v95 in (("Cn1", 10.0), ("Cn2", 90.0))])
+    _i95 = _o95.find("[Cn2 ·")
+    _a95, _b95 = (_o95[:_i95], _o95[_i95:]) if _i95 >= 0 else ("", "")
+    chk("C95", "replay 2c 按 group 分表: 合成 Cn1(全 10.0)/Cn2(全 90.0) 两组样本上, 两组的 "
+               "wave=1 中位必须各自是 10.0 与 90.0 —— 混在一张表里会得到 ~50, 当场红",
+        _i95 >= 0 and "中位  10.0" in _a95 and "中位  90.0" in _b95
+        and "中位  90.0" not in _a95,
+        "rc=%s Cn1 段尾=%r Cn2 段头=%r" % (_rc95, _a95[-90:], _b95[:90]))
+
+    # ---- C96 2c 必须按 **screen_workers(真配置)** 分桶 ----
+    # v2.3.38 (审查方 N1): 台账把「4 路分摊」的判定口径押在"跨 SCREEN_WORKERS 对照"上, 而 2c
+    # 只按 (group, wave) 分桶 —— 那个实验的样本一进来, wave=1 的桶里就同时装着 W=1 的 76.0 与
+    # W=4 的 22.0, 中位打到 **49.0**(任何配置下都不存在的数); W=1 少跑一轮, 中位就翻到 22 那一侧,
+    # 结论反向。更贵的是那段文案: 同 IP 行写"不是并发效应", 而在跨配置样本里那一行**恰恰就是**。
+    # v2.3.39 (审查方 P1-A): 分桶键当时写成 `screen_need` —— 那是**错的**, need = 80 × max(进场
+    # 档位) 是派生量, max 档是观测值。这一条现在钉的是 `screen_workers`:
+    #   - 两桶必须各自成表, 标签是 `W=1` / `W=4`(不是 need=80/need=320);
+    #   - **W=4 那一段里不许出现 76.0** —— 桶混了就会漏进来, 这是比"49.0 没出现"更强的判别器
+    #     (W=1 侧补到 2 行后, 混桶的中位是 76.0 而不是 49.0, 靠 49.0 抓不住);
+    #   - 两侧 n = 2 / 4 都够, 所以 Δ -54.0 必须打出来(v2.3.39 P3-E 的 n 下限没把它误伤);
+    #     另一组 Cn2 故意把 W=1 那侧压到 **n=1**, 那一组必须打「Δ 不报(一侧 n<2)」——
+    #     同一个夹具同时钉住"该报的报"和"不该报的不报", 否则 n 下限掉了这条也不会红。
+    _ips96 = ["4.4.4.4", "5.5.5.5", "6.6.6.6", "7.7.7.7"]
+    _rows96 = []
+    for _g96, _n96 in (("Cn1", 2), ("Cn2", 1)):
+        for _k96 in range(_n96):
+            _rows96.append({"ts": "%sW1-%d" % (_g96, _k96), "group": _g96,
+                            "screen_floor": 80.0,
+                            "screen_need": 80.0, "screen_workers": 1,
+                            "screen": [[76.0, _i] for _i in _ips96],
+                            "screen_wave": dict((_i, 1) for _i in _ips96)})
+        for _k96 in range(4):
+            _rows96.append({"ts": "%sW4-%d" % (_g96, _k96), "group": _g96,
+                            "screen_floor": 80.0,
+                            "screen_need": 320.0, "screen_workers": 4,
+                            "screen": [[22.0, _i] for _i in _ips96],
+                            "screen_wave": dict((_i, (_j % 4) + 1)
+                                                for _j, _i in enumerate(_ips96))})
+    _rc96, _o96 = _replay(d, _rows96)
+    _i96w1 = _o96.find("[Cn1 · W=4]")
+    _seg96 = _o96[_i96w1:_o96.find("\n   [", _i96w1 + 1)] if _i96w1 >= 0 else ""
+    chk("C96", "replay 2c 按 **screen_workers**(真配置) 分桶: W=1/76.0 与 W=4/22.0 的合成样本上, "
+               "两桶必须各自成表(W=1 / W=4 两个标签)、**W=4 段里不许漏进 76.0**"
+               "(桶混了就会)、混合物『中位  49.0』不许出现、Cn1(两侧 n=2/4)必须打出 Δ -54.0、"
+               "Cn2(W=1 那侧只有 n=1)必须打『Δ 不报(一侧 n<2)』",
+        "[Cn1 · W=1]" in _o96 and "[Cn1 · W=4]" in _o96
+        and _seg96 and "76.0" not in _seg96
+        and "中位  49.0" not in _o96
+        and "Δ -54.0" in _o96
+        and "Δ 不报(一侧 n<2: n=1 / n=4)" in _o96,
+        "rc=%s 桶=%r W4段含76.0=%r 混物出现=%r Δ=%r n下限=%r"
+        % (_rc96,
+           [l.strip() for l in _o96.splitlines() if l.strip().startswith("[Cn")][:4],
+           "76.0" in _seg96, "中位  49.0" in _o96, "Δ -54.0" in _o96,
+           "Δ 不报(一侧 n<2: n=1 / n=4)" in _o96))
+
+    # ---- C97 [字段] 完整率必须按**首现行**分口径 ----
+    # v2.3.38 (审查方 N2): 原来"缺 N 行"是两义合一 —— 老版本本来没有该字段, 与新版本该写没写,
+    # 打出来一模一样。而"缺席原因必须可辨"这条论证在这套系统里已经写过四遍(quick_skip /
+    # l0_pool+probed+alive / screen_skip / screen_zero), 回放器自己的完整率检查是唯一没遵守的。
+    # 夹具: 第 0 行老格式没有 need, 第 1/2 行有, 第 3 行**新格式但丢了字段** ——
+    # 正确输出是「缺 1 行(首现于第 1 行」: 老行不算缺, 新行丢字段仍要红。
+    _rows97 = [{"ts": "old", "group": "Cn1", "screen": [[30.0, "1.1.1.1"]],
+                "screen_wave": {"1.1.1.1": 4}}]
+    _rows97 += [{"ts": _t97, "group": "Cn1", "screen": [[30.0, "1.1.1.1"]],
+                 "screen_wave": {"1.1.1.1": 4}, "screen_need": 320.0}
+                for _t97 in ("new1", "new2")]
+    _rows97.append({"ts": "new3", "group": "Cn1", "screen": [[30.0, "1.1.1.1"]],
+                    "screen_wave": {"1.1.1.1": 4}})   # 新格式却丢了 need
+    _rc97, _o97 = _replay(d, _rows97)
+    chk("C97", "[字段] 按首现行分口径: 4 行样本(第 0 行老格式无 need / 1-2 行有 / 第 3 行**新格式"
+               "丢字段**)上, screen_need 必须报『缺 1 行(首现于第 1 行』—— 老行不算缺、"
+               "新行丢字段仍要红",
+        "缺 1 行(首现于第 1 行" in _o97,
+        "rc=%s 该行=%r" % (_rc97,
+                           [l.strip() for l in _o97.splitlines()
+                            if l.strip().startswith("screen_need")][:2]))
+
+    # ---- C98 note 必须进 WANTED, 且 README 字段表与它逐键一致 ----
+    # v2.3.38 (审查方 N4): `note` 是 decision_note() 的输出 —— 整套系统里**唯一**承载"为什么这么
+    # 判"的字段, 却是唯一不进完整率检查的字段(README 字段表 28 键, WANTED 只有 27)。整列消失时
+    # 全绿。这里不只查"note 在里面", 还把 README 那张表与 WANTED **逐键**对一遍: 两张表都在人手里
+    # 改, 只有一处改就会漂 —— 而这正是 v2.3.37 那类"文档说 48、实测 45"的来源。
+    _rm98 = open(os.path.join(d, "nas-README.md"), encoding="utf-8").read()
+    _ln98 = [l for l in _rm98.splitlines() if l.startswith("| `samples.jsonl`")]
+    _keys98 = []
+    if _ln98 and "{" in _ln98[0] and "}" in _ln98[0]:
+        _keys98 = [k.strip() for k in _ln98[0].split("{")[1].split("}")[0].split(",") if k.strip()]
+    chk("C98", "`note`(决策理由, decision_note 的输出) 进 replay 的 WANTED 完整率检查, 且 "
+               "README 字段表的键集合与 WANTED 完全一致(两张表都由人改, 只改一处就会漂)",
+        "note" in _rpl.WANTED and _keys98 and set(_keys98) == set(_rpl.WANTED),
+        "WANTED %d 键(note=%r) / README %d 键 / 只在 README=%r / 只在 WANTED=%r"
+        % (len(_rpl.WANTED), "note" in _rpl.WANTED, len(_keys98),
+           sorted(set(_keys98) - set(_rpl.WANTED)), sorted(set(_rpl.WANTED) - set(_keys98))))
+
+    # ---- C99 全 W=4 的样本里**不许**凭空生出跨配置 Δ ----
+    # v2.3.39 (审查方 P1-A): 这是上一版最贵的一次出错的**可执行形态**。上一版按 `screen_need`
+    # 分桶, 而 need = 80 × max(进场档位) 编的是"那一夜进场了几个节点", 不是"跑在几路下"。
+    # 夹具: 3 行**全部 screen_workers=4**, 只有第 0 行是健康夜(wave 到 4 ⇒ need 320),
+    # 另两行是劣化夜(L0 只活 3 个 ⇒ wave 只到 3 ⇒ need 240), 分数 22.0 / 74.0 拉开。
+    # 上一版在这批数据上打出 `Δ +52.0` 并标成「这才是『4 路分摊』的答案」—— 那个 Δ 从头到尾
+    # 没有并发参与, 它是"劣化夜 vs 健康夜"。三件断言: 只有**一个**桶且标签是 W=4 / 全文一个
+    # `Δ` 都没有 / 同一 W 下 need 不同必须被点名为"进场的节点数不同, 不是配置不同"。
+    _ips99 = ["4.4.4.4", "5.5.5.5", "6.6.6.6", "7.7.7.7"]
+    _rows99 = [{"ts": "healthy", "group": "Cn1", "screen_floor": 80.0,
+                "screen_need": 320.0, "screen_workers": 4,
+                "screen": [[22.0, _i] for _i in _ips99],
+                "screen_wave": dict((_i, (_j % 4) + 1) for _j, _i in enumerate(_ips99))}]
+    _rows99 += [{"ts": _k99, "group": "Cn1", "screen_floor": 80.0,
+                 "screen_need": 240.0, "screen_workers": 4,
+                 "screen": [[74.0, _i] for _i in _ips99],
+                 "screen_wave": dict((_i, (_j % 3) + 1) for _j, _i in enumerate(_ips99))}
+                for _k99 in ("dead1", "dead2")]
+    _rc99, _o99 = _replay(d, _rows99)
+    chk("C99", "3 行**全是 screen_workers=4**、其中 2 行是劣化夜(need=240)的样本上, 2c 必须只有"
+               "**一个桶**(W=4 3 行)、全文**一个 Δ 都不许有**(上一版在这里凭空打出 Δ +52.0 并"
+               "标成『4 路分摊』)、且必须点名『同一 W 下 need 不同不是配置不同』",
+        _o99.count("[Cn1 · W=4] 3 行") == 1 and "[Cn1 · W=240" not in _o99
+        and "Δ" not in _o99
+        and "同一 W 下 need 不同**不是配置不同**" in _o99,
+        "rc=%s 桶=%r need桶=%r Δ出现=%r 派生说明=%r"
+        % (_rc99,
+           [l.strip() for l in _o99.splitlines() if l.strip().startswith("[Cn1 ·")][:3],
+           "[Cn1 · W=240" in _o99, "Δ" in _o99, "同一 W 下 need 不同" in _o99))
+
+    # ---- C100 坏夜(row 留了但无冠军)不算字段缺损 ----
+    # v2.3.39 (审查方 P1-B): `test_pool` 返回 None 时 `dec[name]` 根本不赋值, 而样本**刻意留行**
+    # (v2.3.30 ③) —— 于是 cur/wr/st_cur/st_cand/q_cur/note/ip/speed 八列长期挂"缺 1 行", 只要
+    # 30 天文件里有过一夜坏网络。检查因此退化成"人眼忽略", 与它要防的"整列写丢"混为一谈。
+    # 判别器一直**在行内**(`decision` 写着 `no winner ...`), 检查却没用 —— 这是"缺席原因必须
+    # 可辨"在这套系统里的第六遍。夹具: 1 健康行 + 1 坏夜行, 八列必须报"有理由缺席"而不是"缺"。
+    _ok100 = {"ts": "ok", "group": "Cn1", "l0": 40.0, "l0_tail": 1.0, "l0_pool": 9,
+              "l0_probed": 9, "l0_alive": 9, "screen": [[30.0, "1.1.1.1"]],
+              "screen_capped": False, "screen_skip": 0, "screen_zero": 0,
+              "screen_wave": {"1.1.1.1": 4}, "screen_floor": 80.0, "screen_need": 320.0,
+              "screen_workers": 4, "quick": [[20.0, "1.1.1.1"]], "quick_skip": 0,
+              "t_l0": 1.0, "t_screen": 1.0, "t_quick": 1.0, "cur": "1.1.1.1", "wr": 1.45,
+              "st_cur": 1, "st_cand": 1, "q_cur": 20.0, "note": "ok", "ip": "1.1.1.1",
+              "speed": 30.0, "decision": "keep 1.1.1.1"}
+    _bad100 = {"ts": "dead", "group": "Cn1", "l0": 40.0, "l0_tail": 1.0, "l0_pool": 9,
+               "l0_probed": 9, "l0_alive": 0, "screen": [], "screen_capped": False,
+               "screen_skip": 0, "screen_zero": 0, "screen_wave": {}, "screen_floor": 80.0,
+               "screen_need": None, "screen_workers": 4, "quick": [], "quick_skip": 0,
+               "t_l0": 1.0, "t_screen": 1.0, "t_quick": 1.0,
+               "decision": "no winner (0 alive)"}
+    _rc100, _o100 = _replay(d, [_ok100, _bad100])
+    chk("C100", "坏夜(screen 空 + decision='no winner ...')的留行不算字段缺损: 8 个决策字段必须报"
+                "『ok(1 行有理由缺席: 坏夜无冠军 …… 不是丢字段)』、screen_need 报『本行粗筛 0 个』"
+                "—— 而不是 9 个『缺 1 行』",
+        _o100.count("ok(1 行有理由缺席: 坏夜无冠军") == 8
+        and "ok(1 行有理由缺席: 本行粗筛 0 个" in _o100,
+        "rc=%s 计数=%d 样本行=%r"
+        % (_rc100, _o100.count("ok(1 行有理由缺席: 坏夜无冠军"),
+           [l.strip() for l in _o100.splitlines()
+            if l.startswith("  ") and "缺 1 行" in l][:4]))
+
+    # ---- C101 need 与 80 × max(wave) 不符必须点名 ----
+    # v2.3.39 (审查方 P1-A 后半): `need` 降级为派生量之后, 它的**唯一定义**就是
+    # `80 × max(进场档位)`。这条等式断了只可能是生产代码换了推导口径(比如改成按池子大小算),
+    # 而那一版所有分桶结论都不再有意义 —— 必须说出来, 不能沉默地继续画表。
+    _ips101 = ["4.4.4.4", "5.5.5.5", "6.6.6.6", "7.7.7.7"]
+    _rc101, _o101 = _replay(d, [
+        {"ts": "drift", "group": "Cn1", "screen_floor": 80.0,
+         "screen_need": 320.0, "screen_workers": 4,
+         "screen": [[30.0, _i] for _i in _ips101],
+         "screen_wave": dict((_i, (_j % 3) + 1) for _j, _i in enumerate(_ips101))}])
+    chk("C101", "need 与 `80 × max(screen_wave)` 不符时必须点名那一行(need 320 但 max 档只到 3 "
+                "⇒ 期望 240): 推导口径被改过就得说出来, 不能拿它继续画表",
+        "1 行的 screen_need 与 80 × max(screen_wave) 不符" in _o101
+        and "need 320, 但 80×max(wave)=240" in _o101,
+        "rc=%s 不符行=%r"
+        % (_rc101,
+           [l.strip() for l in _o101.splitlines() if "不符" in l or "80×max(wave)=" in l][:3]))
+
+    # ---- C102 第六节的真值必须 leave-one-out ----
+    # 第三十九轮给探针加了第六节(`SCREEN_N` 该取几), 结论是「N=12 就够」—— 而那条结论**一个断言
+    # 都没有**: 真值口径(剔掉被评那一轮)就写在一个 `if j == i: continue` 里, 改成不剔 = 拿答案
+    # 对答案, 召回率被系统性抬高, 而表照打、报告照绿。探针从"解释现象"变成"给建议"之后,
+    # 它的话就得能被抓 —— 这是本轮唯一的理由。
+    # 夹具刻意做成三分: 1.1.1.1 在三轮里是 1.0 / 100.0 / 60.0。
+    #   剔掉 r0 ⇒ 中位 80.0, 它才是 r0 的真冠军, 而 r0 实测它排第 4 ⇒ 不命中;
+    #   不剔   ⇒ 中位 60.0, 真冠军换成 2.2.2.2(恰好是 r0 的头名) ⇒ 白送一次命中。
+    # 于是「Top1 1/3」与「Top1 2/3」就是"剔没剔"的判别器, 不必读源码。
+    # 走**子进程**是有意的: 这条覆盖的是用户真会跑的那条路(--from-json → 报告 → 第六节)。
+    def _mk102(rows, wmax=4):
+        out = []
+        for _i, _sc in enumerate(rows):
+            out.append({"w": 4, "n_nodes": len(_sc), "el": 10.0, "scores": _sc,
+                        "capped": [], "skip": [], "zero": [],
+                        "wave": dict((ip, (_k % wmax) + 1)
+                                     for _k, ip in enumerate(sorted(_sc))),
+                        "round": _i, "warmup": False, "log": ""})
+        return out
+
+    def _rep102(_mod, _cells, _ns):
+        """就地跑真 `report()` 并把打印收进字符串 —— 比再起一个解释器快一个数量级。"""
+        _b = io.StringIO()
+        with contextlib.redirect_stdout(_b):
+            _mod.report(_cells, [4], _cells[0]["n_nodes"], 8, ns=_ns, prod_n=8, max_cands=16)
+        return _b.getvalue()
+
+    _ep102 = os.path.join(d, "tests", "exp_screen_workers.py")
+    if not os.path.isfile(_ep102):
+        _ep102 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "exp_screen_workers.py")
+    _e102 = load(_ep102, "exp102")
+    _c102 = _mk102([
+        {"1.1.1.1": 1.0, "2.2.2.2": 70.0, "3.3.3.3": 65.0, "4.4.4.4": 60.0},
+        {"1.1.1.1": 100.0, "2.2.2.2": 70.0, "3.3.3.3": 65.0, "4.4.4.4": 60.0},
+        {"1.1.1.1": 60.0, "2.2.2.2": 70.0, "3.3.3.3": 65.0, "4.4.4.4": 60.0}])
+    _rc102, _o102 = _probe(d, _c102, ns="1")
+    chk("C102", "第六节真值必须 leave-one-out(剔掉被评那一轮): 1.1.1.1 三轮 1.0/100/60, 剔掉 r0 后"
+                "中位 80.0 ⇒ 它才是 r0 的真冠军(本轮第 4 名, 不命中); 中位若含本轮(60.0)真冠军就换成"
+                " 2.2.2.2 ⇒ Top1 命中从 1/3 变 2/3 —— 拿答案对答案会把召回率系统性抬高",
+        "进 Top1 1/3 轮" in _o102 and "r0(真冠军本轮第 4 名)" in _o102
+        and "r1(真冠军本轮第 2 名)" in _o102,
+        "rc=%s 命中/丢因行=%r" % (_rc102, [l.strip() for l in _o102.splitlines()
+                                          if "进 Top" in l or "丢在" in l][:3]))
+
+    # ---- C103 `_topk` / `_rank_of` 必须是同一把尺子 ----
+    # 两个结论量(前 8 重合率 / 真冠军名次)都建在 `_topk` 上。并列时若一处按 IP 字典序、另一处
+    # 按插入序,「前 8 只重合 3/8」就变成排序实现的函数而不是数据的函数 —— 而那正是第三十八轮
+    # 用来判定"并发真的在改名次"的判据。喂纯函数, 不绕报告。
+    _sc103 = {"9.9.9.9": 5.0, "1.1.1.1": 5.0, "2.2.2.2": 6.0, "3.3.3.3": 1.0}
+    _t103 = _e102._topk(_sc103, 2)
+    _r103 = [_e102._rank_of(_sc103, ip) for ip in ("2.2.2.2", "1.1.1.1", "9.9.9.9", "3.3.3.3")]
+    _r103.append(_e102._rank_of(_sc103, "8.8.8.8"))
+    chk("C103", "`_topk` 与 `_rank_of` 同一把尺子: 分数降序 + 并列按 IP 字典序(5.0 平手时 "
+                "1.1.1.1 排在 9.9.9.9 之前), 名次 1/2/3/4, 不在本轮的 IP 返回 0",
+        _t103 == ["2.2.2.2", "1.1.1.1"] and _r103 == [1, 2, 3, 4, 0],
+        "top=%r ranks=%r" % (_t103, _r103))
+
+    # ---- C104 不足 3 轮必须拒答 ----
+    # 两轮的中位里每一档只有一次测量 —— 那不是中位, 是"拿一次测量代表一档"(和 2c 的 n≥2 同一条纪律)。
+    # 这一节的价值在于它**会**说"别信", 所以那条 return 掉了不会有任何别的断言变红。
+    _c104 = _mk102([
+        {"1.1.1.1": 10.0, "2.2.2.2": 20.0},
+        {"1.1.1.1": 10.0, "2.2.2.2": 20.0}])
+    _o104 = _rep102(_e102, _c104, [1])
+    chk("C104", "第六节在只有 2 轮时必须拒答(「该档只有 2 轮(< 3), 真值不可靠, 不做召回分析」), "
+                "且**不许**打出「含真冠军」—— 少样本也给结论, 等于拿一次测量代表一档",
+        "该档只有 2 轮(< 3)" in _o104 and "含真冠军" not in _o104,
+        "拒答行=%r 含结论=%r" % ([l.strip() for l in _o104.splitlines() if "< 3" in l][:2],
+                                 "含真冠军" in _o104))
+
+    # ---- C105 wave 自证: 并发没生效的格不许当成"这一档的数据" ----
+    # 这是整个实验的地基断言: 改了 `SCREEN_WORKERS` 却没生效时, 那一格的分数看着完全正常
+    # (48 个都有分), 只有 `max(screen_wave)` 会说真话。冒烟测试时就靠它抓到过(3 节点开 4 路)。
+    # 恒打 OK 等于把地基换成装饰。
+    _c105 = _mk102([
+        {"1.1.1.1": 10.0, "2.2.2.2": 20.0, "3.3.3.3": 30.0, "4.4.4.4": 40.0},
+        {"1.1.1.1": 10.0, "2.2.2.2": 20.0, "3.3.3.3": 30.0, "4.4.4.4": 40.0},
+        {"1.1.1.1": 10.0, "2.2.2.2": 20.0, "3.3.3.3": 30.0, "4.4.4.4": 40.0}], wmax=3)
+    _o105 = _rep102(_e102, _c105, [])
+    chk("C105", "wave 自证: 档位 W=4 而 `max(screen_wave)` 只到 3 时必须判「与配置不符 ⇒ 这一档的"
+                "并发没生效」(分数看着正常, 只有这个数会说真话); W=4 的格反过来不许报警",
+        "与配置不符 ⇒ 这一档的并发没生效" in _o105
+        and "max(screen_wave) 实际取值 [4] OK" in _rep102(_e102, _c102, []),
+        "坏格行=%r 好格含 OK=%r"
+        % ([l.strip() for l in _o105.splitlines() if "自证" in l][:1],
+           "实际取值 [4] OK" in _rep102(_e102, _c102, [])))
 
     # ---- C86 results.json 合并: 三条静默丢一组的路全部堵住 ----
     # 审查方 P1-B: C13 验读侧(损坏 -> 空表, 那是**对的**)、C22 验写侧(seed 是合法 Cn2),
@@ -2923,7 +3314,7 @@ def audit_behaviour(d):
     # 且这个状态**自我维持**。C86 当时五条全绿, 恰恰因为它验的是"不覆盖", 而"不覆盖"正是成因。
     # 所以这条必须连跑两轮: 第一轮隔离 + 重建, 第二轮走正常合并(还能吃回别的组) —— 只验第一轮,
     # 验不出这条永久故障。
-    _tmp86 = tempfile.mkdtemp(prefix="res86_")
+    _tmp86 = _mktmp(prefix="res86_")
     _p86 = os.path.join(_tmp86, "results.json")
     _corrupt86 = '{坏 json'
     with open(_p86, "w", encoding="utf-8") as _fw86:
@@ -2947,31 +3338,37 @@ def audit_behaviour(d):
         _after2 = None
     # 首次部署(文件不存在)是正常态, 不能被当成"损坏"而报 rebuilt
     _p86e = os.path.join(_tmp86, "results-fresh.json")
-    _m86c, _st86c = x86.persist_results(_p86e, _s86, _k86, ts=1700000002)
+    (_m86c, _st86c), _o86c = capture(x86.persist_results, _p86e, _s86, _k86, ts=1700000002)
     # ④ v2.3.36 (审查方 M2): created 不能用"文件不在"当判据 —— 上一轮 unrepaired 之后文件
     # 也是不在的(坏表已被 os.replace 挪去隔离, 新文件又没写成), 两者完全同形。status 值本身
     # 有损, 与 P3-F 的 canary bool 同病, 只是代价在日志。造这条链: ①写成功一次(留下 .seen)
     # ②删掉 results.json(等价于"隔离挪走 + 没写成") ③再跑 -> 必须是 created_after_writefail。
+    # v2.3.37 (审查方 P2-2): 光有 status 值不够 —— main 里那对返回值全仓零读者, 所以"日志里
+    # 两者同形"这件事**没被修**。现在 ④ 连**输出**一起断言: created 静默、写失败必须带 warn。
     _p86d = os.path.join(_tmp86, "results-wf.json")
     x86.persist_results(_p86d, _s86, _k86, ts=1700000003)
     _seen86 = os.path.isfile(_p86d + ".seen")
     os.remove(_p86d)
-    _m86d, _st86d = x86.persist_results(_p86d, _s86, _k86, ts=1700000004)
+    (_m86d, _st86d), _o86d = capture(x86.persist_results, _p86d, _s86, _k86, ts=1700000004)
     chk("C86b", "results.json 坏表**连跑两轮**: ①第一轮 status=rebuilt、坏字节被隔离成 .corrupt-<ts>"
                 "(内容原样) 、文件已可读且只含本轮组 ②第二轮 status=ok 走正常合并并吃回别的组 "
                 "③首次部署(无文件)= created 而不是 rebuilt "
-                "④写过一次后文件不见了(上一轮写了没成功) = created_after_writefail, 不是 created",
+                "④写过一次后文件不见了(上一轮写了没成功) = created_after_writefail, 不是 created; "
+                "而且这一对在**日志里也不能同形**: 首次部署静默、写失败后重建必须打 warn",
         _st86a == "rebuilt"
         and bool(_bak86) and _bak86_txt == _corrupt86
         and [g.get("group") for g in (_after1 or [])] == ["Cn1"]
         and _st86b == "ok"
         and sorted(g.get("group") for g in (_after2 or [])) == ["Cn1", "Cn2"]
         and _st86c == "created" and os.path.isfile(_p86e)
-        and _seen86 and _st86d == "created_after_writefail" and os.path.isfile(_p86d + ".seen"),
-        "①st=%r bak=%r 内容一致=%r 文件=%r ②st=%r 组=%r ③st=%r ④seen=%r st=%r"
+        and _seen86 and _st86d == "created_after_writefail" and os.path.isfile(_p86d + ".seen")
+        and "[warn]" not in _o86c
+        and "[warn]" in _o86d and "上一轮写了没成功" in _o86d,
+        "①st=%r bak=%r 内容一致=%r 文件=%r ②st=%r 组=%r ③st=%r out=%r ④seen=%r st=%r out=%r"
         % (_st86a, _bak86, _bak86_txt == _corrupt86,
            [g.get("group") for g in (_after1 or [])],
-           _st86b, [g.get("group") for g in (_after2 or [])], _st86c, _seen86, _st86d))
+           _st86b, [g.get("group") for g in (_after2 or [])], _st86c, _o86c.strip()[:40],
+           _seen86, _st86d, _o86d.strip()[:40]))
 
     # ---- C91 候选截断排序: 三态不得压回同一个键 ----
     # v2.3.35 (审查方 P2-5): `score.get(ip, 0.0)` 让"预算跳过没测到"与"测了 0 分"等价,
@@ -3008,7 +3405,7 @@ def audit_behaviour(d):
     # 第二组算 other_pins 时看到的是第一组的**旧** IP。两组切到同一个节点, 而那条
     # 「单节点故障会同时打掉两组」的 warn 一次都不会响 —— 它比的是"对方上一轮钉着谁"。
     m87 = load(wd_p, "wd87")
-    m87.BASE = tempfile.mkdtemp()
+    m87.BASE = _mktmp()
     m87.get_pins = lambda: {"Cn1": "1.1.1.1", "Cn2": "2.2.2.2"}
     m87.steady = lambda ip, host=None, path=None: 99.0 if ip == "7.7.7.7" else 0.0   # 两组死, 备胎好
     m87.load_hotspares = lambda n: [{"ip": "7.7.7.7", "steady": 99}]   # 两组备胎是同一个
@@ -3027,7 +3424,7 @@ def audit_behaviour(d):
     # ---- C88 冷却带组维度: 一组的重测不得压住另一组 ----
     # 审查方 P2-D: 标记只有一个 epoch, 08:30 修了 Cn1, 09:00 Cn2 整组死, 09:30 只止血不重测, 最长压 3 小时。
     m88 = load(wd_p, "wd88")
-    m88.BASE = tempfile.mkdtemp()
+    m88.BASE = _mktmp()
     with open(os.path.join(m88.BASE, m88.RETEST_MARK_NAME), "w", encoding="utf-8") as f:
         f.write(json.dumps({"Cn1": int(time.time() - 60)}))     # 只压 Cn1
     _left88a = m88.retest_cooldown_left("Cn1")
@@ -3102,7 +3499,7 @@ def _stub_wd(wd_p):
     class S:
         def __init__(self):
             self.m = load(wd_p, "wd")
-            self.m.BASE = tempfile.mkdtemp()
+            self.m.BASE = _mktmp()
             self.pins = {}
             self.q = {}
             self.out = ""
@@ -3225,7 +3622,7 @@ def audit_hygiene(d):
         # 于是 push 永远不带它、而它自己在 NAS 上永远缺; D8 却因为 `_want` 也只数两个 tests 而全绿。
         # 交付集合从这个常量走, 别再手抄一份。
         _want = set(files) | {"tests/audit.py", "tests/selftest_audit.py", "tests/replay.py",
-                              "../AI共管台账.md"}
+                              "tests/exp_screen_workers.py", "../AI共管台账.md"}
         chk("D8", "deliver.sh 的 PAIRS 与交付集合一一对应(漏一行=那个文件在 NAS 上永远是旧版而 check 说 ok)",
             bool(_blk) and set(_pl) == _want, "PAIRS=%s 多=%s 少=%s"
             % (sorted(_pl), sorted(set(_pl) - _want), sorted(_want - set(_pl))))
@@ -3329,10 +3726,27 @@ def main():
     # A26: 跑完对账。断言的是"文件的字节没变", 不是"用例记得改 BASE" —— 后者靠自觉, 而且
     # 2026-11-07 已经靠不住一次(38 行假样本混进真 samples.jsonl, 人眼在 39 行里挑不出来)。
     _prod_after = run_products_state(d)
-    _dirty = [n for n in RUN_PRODUCTS if _prod_before.get(n) != _prod_after.get(n)]
-    chk("A26", "审计不写交付态: 跑完 audit 后 samples/results/speed.log/.last_retest/run.log 一字节不动",
+    # v2.3.37 (P3-4): 键集取并集 —— 隔离文件是"跑之前不存在、跑之后冒出来"的那种, 只遍历
+    # RUN_PRODUCTS 会看不见它(新造一个文件 = 最典型的污染, 而它恰好不在固定清单里)。
+    _dirty = [n for n in sorted(set(_prod_before) | set(_prod_after))
+              if _prod_before.get(n) != _prod_after.get(n)]
+    chk("A26", "审计不写交付态: 跑完 audit 后 samples/results/results.json.seen/corrupt-*/speed.log/"
+               ".last_retest/run.log 一字节不动(新增文件也算改动)",
         not _dirty, "被改动=%s (before=%s after=%s)"
         % (_dirty, [_prod_before.get(n) for n in _dirty], [_prod_after.get(n) for n in _dirty]))
+    # D9: 审计自己造的临时目录必须删干净。断言本身不难, 难的是它**必须放在最后** ——
+    # 前面每一条用例的 BASE/沙箱都是 `_mktmp()` 建的, 这里一次性 rmtree 掉, 再回头点一遍
+    # "注册过的目录现在都不在了"。这条是 2026-11-08 从 NAS 上捡回来的: /tmp 累积 238819 个
+    # 条目、tmpfs 塞满, selftest 跑到 M2 就 ENOSPC 退出 —— 而它退出的样子像"注入点不存在",
+    # 不像"审计留垃圾"。`_made > 0` 是防这条断言变成空转(真有一天不再建临时目录, 它该显式红)。
+    _made = len(_TMPDIRS)
+    for _t in _TMPDIRS:
+        shutil.rmtree(_t, ignore_errors=True)
+    _left = [_t for _t in _TMPDIRS if os.path.exists(_t)]
+    chk("D9", "审计自己造的临时目录全部删掉(收尾前注册 %d 个, 残留 0): NAS /tmp 是 tmpfs, "
+              "历史残留曾累积 23.8 万条并把自检卡死在 ENOSPC"
+        % _made, _made > 0 and not _left, "残留=%s" % _left[:5])
+
     fail = [r for r in RESULTS if not r[2]]
     print("\n失败出口统计: %d 个函数 / %d 条出口" % (len(actual), sum(actual.values())))
     print("RESULT: %d 项, 全过" % len(RESULTS) if not fail

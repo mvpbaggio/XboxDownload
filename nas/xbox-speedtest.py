@@ -2,17 +2,95 @@
 # -*- coding: utf-8 -*-
 r"""
 Xbox 加速 - NAS 定时自动测速找最快节点并更新路由器 (ZOS/Python3.8 兼容)
+v2.3.39 (2026-11-08 第三十六轮 —— 审查方五条(P1-A/P1-B/P2-C/P2-D/P3-E)**全部属实**;
+          最重的一条是它把我**上一轮刚写进代码的前提**推翻了。阈值/并发/排序口径一个未动,
+          决策分支一行未碰; 主程序这一轮只加了一个**观测字段**, 不改任何判定):
+  - (P1-A, 最重) **`screen_need` 不是配置指纹** —— 我上一版把 `need = 80 × max(进场档位)` 当成
+    "配置 = 几路", 而 `_wave_max` 是**观测到的**最大档位, 上限由 `len(screen_rows)` 决定:
+    池里只活 3 个节点时 4 路配置也只到档位 3 → need=240, 与"W=3 的配置"逐字同形。
+    实测两条: (a) 3 个节点 → wave {1,2,3} → need 240; (b) 48 个节点 + budget=0.06s 截断
+    (只测 5 个) → wave 仍是 {1,2,3,4} → need 仍是 320 —— **我上一版 changelog 写的
+    "预算提前收手时 4 路只跑到 3 档 → need=240" 是假的**: 截断压掉的是被测节点数, 不是
+    max 档(4 个 worker 一提交就各领一个)。后果实测: 3 行**全是 W=4**、只有第 1 行是"劣化夜
+    L0 只活 3 个", replay 就打出 `Δ +52.0 (+186%)` 并标成「这才是『4 路分摊』的答案」——
+    **在从未做过实验的前提下凭空产出一份带百分号的"证据"**。修: 样本新增 `screen_workers`
+    (真配置指纹, 直接记 SCREEN_WORKERS), 2c 分桶键改用它; `screen_need` 降级为派生量,
+    replay 每行验 `need == 80 × max(wave)`, 不成立就**点名那一行**而不是拿它分桶。
+  - (P1-B) "坏夜无冠军"的行被 `[字段]` 判成 9 个字段缺损(含上一轮刚加的 `note`)。那不是缺陷:
+    `test_pool` 返回 None 时 `dec[name]` 不赋值, 而样本刻意留行(v2.3.30 ③)。30 天文件里只要
+    有过一夜坏网络, 这 9 个字段就长期挂非零缺数 —— 完整率检查当场退化成"人眼忽略"。
+    行内本来就有判别器(`decision` = `no winner ...`), 检查却没用。修: 决策字段在这类行上
+    算"有理由缺席"并单独计数, 不再计入缺 N。
+  - (P2-C) `need=null` 两种成因压成一种, 且标签断言了**错的那一种**: 新格式的坏夜行在 `[字段]`
+    被说成"缺 1 行"、在 2c 被说成"配置未知(v2.3.33 及更早)"—— 它既不老也不缺。判别器行内就有
+    (`screen_floor` 在 ⇒ 新格式)。修: 2c 的桶改用 W 之后这类行自然落在 W=4 桶里, 行头单独打
+    「其中 N 行粗筛 0 个(坏夜无结果)」; `[字段]` 对它同样按"有理由缺席"处理。
+  - (P2-D) 跨配置段按 **IP 字典序**取前 8 —— 上一轮只修了同配置段的同一个偏倚(48 个 IP 时等于
+    按网段取)。修: 改成按 **|Δ| 从大到小**, 且 Δ 只在两侧 n 都够时才报。
+  - (P3-E) Δ 是"不同时刻两个中位数相减", 没有 n 下限也没有误差条, 而 C96 把它钉成了契约。
+    修: 两侧 n 都打出来, 任一侧 n<2 就**不报 Δ**、改印"n 不足"; 百分号只在 n 够时出现。
+  - 记账: 断言 172 → **175**(C96 重写为按 W 分桶并把"该报 Δ / n 不足不报 Δ"压进同一个夹具 /
+    C99 全 W=4 的样本里不许凭空生出 Δ / C100 坏夜留行不算缺字段 / C101 need 与 80×max(wave)
+    不符要点名), 变异 125 → **129**。
+  - 自检撞出来的第七处(不是审查方提的): 这一版第一次出现**三位**检查编号(C100/C101), 而 A19 的
+    两处正则都卡在 `\d{1,2}` —— 真编号认不出、文档里写个不存在的 `C199` 也照样全绿(实测 175 项
+    全过)。已放宽到 `\d{1,3}`; M60 的假编号随之从 `C99`(这一版成了真编号)换成 `C199`。
+v2.3.38 (2026-11-08 第三十五轮 —— 审查方五条**全部属实**, 而这一轮**主程序一行未改**:
+          五条全在 replay(2c 分桶键 / 字段完整率口径 / WANTED) 与 C93 的判据上。版本号只跟着走):
+  - (N1, 最重) [**v2.3.39 更正: 本条把 `screen_need` 当成"配置指纹"是错的** —— 它同时被"那一夜
+    L0 活下来几个节点"改写, 见上面 P1-A。分桶键现在是 `screen_workers`, need 降为派生量。]
+    台账把「4 路分摊」的判定口径改成"跨 SCREEN_WORKERS 对照", 而 replay 2c 的分桶键
+    只有 (group, wave) —— 配置指纹 `screen_need` 一次都没读。一份"W=1 跑 1 轮 76.0 + W=4 跑
+    4 轮 22.0"的合成样本复现出来: wave=1 的桶里同时装着 4 个 76 与 4 个 22, 打出「中位 49.0」,
+    这个数在任何配置下都不存在; W=1 少跑一轮, 中位就翻到 22 那侧, 结论反向。修: 分桶键改
+    (group, screen_need), 跨 need 的同 IP 中位差才是「4 路分摊」, 同 need 内档位差仍只说 RTT
+    名次; need 缺失的行单独一桶(标"配置未知"), 不猜。**没做**跨 SCREEN_WORKERS 的实验(见账)。
+  - (N2) `[字段]` 的"缺 N 行"两义合一: 老版本没有该字段 与 新版本该写没写, 打出来一样。而
+    "缺席原因必须可辨"这条论证在这套系统里已经写过四遍。修: 按各字段**首现行**分口径, 拐点之前
+    的行按老格式跳过并明说; 另把 2c 里"配不上的 IP 静默 continue"改成计数打印(真机 383 条里
+    143 条是这么消失的, 全是 v2.3.32/33 的老行)。
+  - (N3) README 自相矛盾: 第 49 行介绍 `tests/replay.py`, 第 65 行写"目前只 append, 不 replay"。
+    修: 第 65 行改成"已可回放"并列出它能回答的四类问题 + 它回答不了的那一类。
+  - (N4) `note`(decision_note 的输出)是唯一承载"为什么这么判"的字段, 却是唯一不进完整率检查的
+    字段(README 字段表 28 键 / WANTED 27)。修: 进 WANTED, 且 C98 把两张表**逐键**对一遍。
+  - (N5) C93 的 `_pair93` **恒真**: 写一个 JSON 字面量、读回来、断言自己写的 key 都在, 中间没有
+    任何生产代码经过。实测: 把 `screen_wave` 改成永远写空字典, 这条照样 PASS(兜住它的是 C82)。
+    修: 真调 `build_sample`, 把输出喂给**真 replay**, 断言"可配对 4 条 / 配不上 1 条"。
+  - 记账: 断言 169 → **172**(C96 分桶 / C97 首现行 / C98 note+README 逐键), 变异 121 → **125**。
+v2.3.37 (2026-11-08 第三十四轮 —— 审查方四条**全部属实**; P1-1 是我上一轮修 M1 时又写进去的
+          第二个"没验过的数字", 而且比措辞更重: 它会让 2c 在两周后给出一条反物理的结论。
+          阈值/并发/排序口径仍然一个未动, 动到的行为只有两处日志):
+  - (P1-1, 命名错 + 数字错, 最重) `wave` **不是并发档位, 是"进场顺序"**。`_run` 里
+    `meta["wave"] = _inflight[0]`(进场那一刻 +1 后读), 而提交顺序 = `screen_rows` = L0 RTT 升序,
+    4 个 worker 只在**起步**时才会产生 1/2/3 —— 于是 wave<4 恒为"本批最先提交的 3 个"、
+    wave=4 是其余全部。真机 5 行样本每行都是 `{1:1, 2:1, 3:1, 4:45}`(**不是**我上一版写的
+    "48 个 IP 全是 4", 是 45/48)。它编码的是 RTT 名次, 不含"被平分了几份"的信息 ——
+    48 个自始至终都跑在 4 路并发下。后果: v2.3.36 的 2c 在"零因果"样本上会打出
+    "4 路比 1 路快 17MiB/s"这种表, 而它看起来非常硬。修: 五处措辞改实测值并写清语义;
+    replay 2c 改名「分数 vs **进场顺序**档位」、**按 group 分表**、同 IP 段标注"这是 RTT 名次
+    变动, 不是并发效应"; 账上"4 路分摊"的判定口径从"攒档位"改成"跨 SCREEN_WORKERS 配置对照"。
+  - (P1-1 附) C93 原来只验"这一列存在"(两个字符串 + 合成配对), 而上面那张错表正是在"列存在"
+    的前提下产出的 —— 它永远绿。修: C93 改述它真正钉的东西; 另加 **C95**: 合成 Cn1/Cn2 两组
+    样本跑 replay, 断言输出**分两张表**且各组档位只来自本组(混组当场红)。
+  - (P2-2, 日志有损) M2 把 status 分细了, 但 `_merged, _st = persist_results(...)` 全仓零读者,
+    而函数里只有 rebuilt/unrepaired 自己 print —— `created` / `created_after_writefail` 在
+    无人值守日志里**仍然同形**, 这正是它上一轮修 P3-F 时的原病换了个位置。修: 两种状态各自
+    print 一行(首次=普通行, 写失败后重建=warn 行), C86b ④ 连输出一起断言。
+  - (P3-4, 守卫集合没跟上) `.seen` 与 `.corrupt-*` 是本轮新增的持久态, A26 的 `RUN_PRODUCTS`
+    仍 5 项。修: 加 `results.json.seen` + `results.json.corrupt-*`(前缀扫描); 并在 docstring
+    写明"`.seen` 存在 ≠ 上一轮写失败, 只说明『写过』" —— 手工删 results.json 想重来时它会
+    谎报一次 created_after_writefail, 这是标记的固有代价, 记在账上当观察项。
+  - 记账: 断言 168 → **169**(C95), 变异 119 → **121**(M120 2c 混组 / M121 created 不打印)。
+
 v2.3.36 (2026-11-08 第三十三轮 —— 三条**都是我自己写出来的**, 其中 M1 是措辞错到会让两周后的
           观测直接放弃的那一类; 阈值/并发/排序口径一个未动, 唯一动到的行为是 status 值):
   - (M1, 措辞, 后果最重) 三处写着"逐 IP 的 wave **没入库**, 相关性算不出来" —— **事实错误**。
     `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的(build_sample), replay 143 行也
-    早就把它和 `screen` 配对取出来了, 只是只拿了 max 去算出口下界。真正算不出的原因是
-    **单行内 wave 常无方差**(满编时 48 个 IP 全是 4), 必须跨行/跨档位攒。两句话方向相反:
-    "没入库" = 结构上永远不可能 → 账上挂着的"4 路分摊"会被判成不可测量; "要先攒档位" = 这两周
-    正好在收。修: 三处措辞改正; replay 新增 **2c 分数 vs 并发档位**(按 wave 分档打中位数/极差,
-    并对出现在 >=2 个档位的 IP 做同 IP 对照 —— 档位一多就能直接读"同节点跨档位变不变");
-    audit 的 [obs] 段同样分档; 新增 **C93** 把事实钉住(build_sample 真按 ip 建 dict + replay 有
-    分档段 + 合成样本上 screen 的 IP 全能在 screen_wave 配对)。
+    早就把它和 `screen` 配对取出来了, 只是只拿了 max 去算出口下界。**v2.3.37 更正**: 这一版
+    接着写的"单行内 wave 常无方差(满编时 48 个 IP 全是 4), 要跨档位攒"**也是错的** —— 实测
+    5 行都是 `{1:1, 2:1, 3:1, 4:45}`(45/48, 不是 48), 而且那 3 个是"本批最先提交"的节点:
+    wave 编码 RTT 名次, 不是并发。见 v2.3.37 的 P1-1。**M1 本身成立**(数据在、配对早就有),
+    错的是"为什么算不出"和"攒一攒就能算"这两句。
   - (M2, status 有损) `created` 原来只表示"文件不在", 而**上一轮写了没成功**(unrepaired: 坏表
     已被隔离挪走、新文件没写成)之后文件也是不在的, 两者完全同形。与刚修完的 P3-F(canary 的
     bool 同时表示四件事)是同一个病, 只是这一处代价在日志、不动决策。修: 写成功后 touch
@@ -44,11 +122,10 @@ v2.3.35 (2026-11-08 第三十二轮 —— 六条新发现**五条属实**, 其�
     每路都在 1..上界); "分数与并发的关系"降到真样本上的观测行。
     **v2.3.36 (审查方 M1) 更正**: 上一版这里写的是"逐 IP 的 wave 没有入库", 那是**事实错误** ——
     `screen_wave` 一直是 `{ip: 进场时同批几路}` 逐 IP 落盘的(build_sample), replay 也早就把它
-    和 `screen` 配对取出来了。真正算不出相关性的原因是**单行内 wave 常无方差**(满编时 48 个 IP
-    的 wave 全是 4), 必须跨行/跨档位攒。两句话的方向相反: "没入库" = 结构上永远不可能, 于是
-    "4 路分摊"这颗挂账会被判成不可测量; "要先攒档位" = 这两周正好在收。现在 replay 按 wave
-    分档打分数中位数/极差(见 2c), 档位一多就能直接读出"同 IP 跨档位分数变不变"。
-    (算不出来还写成断言, 就是下一条 N5 那个毛病 —— 但不写 ≠ 写"永远算不出来"。)
+    和 `screen` 配对取出来了。**v2.3.37 再更正**: 这一版接着写的"单行内 wave 常无方差(满编时
+    48 个 IP 的 wave 全是 4), 要跨档位攒"**也是错的** —— 实测 5 行都是 `{1:1,2:1,3:1,4:45}`,
+    而且 wave<4 恒为"本批最先提交的 3 个"(提交顺序 = L0 RTT 升序): 它编码 RTT 名次, 不是并发。
+    所以"攒够档位就能读分摊"这条路走不通, 见 v2.3.37 P1-1 与 replay 2c 的新标题。
   - (N3) `decision_note` 的极差与中位数**口径不一**: `median_of` 去 0(0 = 这一轮没测出),
     `min/max` 吃含 0 的 rs —— 0/45/47 会打出「受抖动支配(三轮 0.0~47.0 横跨阈值)」,
     把"一轮没测出来"说成"抖动", 而这两件事处置相反(抖动等下一轮, 没测出查网络)。
@@ -784,6 +861,10 @@ def persist_results(out_path, summary, known, ts=None):
     它(内容只是时间戳, 给人看"上次写成功是什么时候")。标记写不成不影响结论, 只是下一轮的
     created 退化成有损 —— 不值得为它让整轮失败。
 
+    v2.3.37 (审查方 P2-2): `created_after_writefail` 现在**自己打一行 warn**, 首次部署保持沉默 ——
+    两者在无人值守日志里不再同形(调用方那个返回值仍然没人读, 但它不再是唯一出口)。
+    代价: 手工删 results.json 想"重来一次"时, `.seen` 还在 → 会打一次谎报, 已在 warn 文案里直说。
+
     观察项(v2.3.36 M3): `.corrupt-<ts>` 隔离文件**永不清理**, NAS 上会慢慢堆。有意不自动删:
     它是坏字节的唯一证据, 自动清理会引入"证据能自己消失"的新问题; 什么时候删由人定。
     """
@@ -807,6 +888,16 @@ def persist_results(out_path, summary, known, ts=None):
         # v2.3.36 (审查方 M2): 只看"文件不在"不够 —— 上一轮 unrepaired 之后文件也是不在的
         # (坏表已被 os.replace 挪去隔离, 新文件又没写成), 与首次部署完全同形。
         status = "created_after_writefail" if os.path.exists(seen_path) else "created"
+        # v2.3.37 (审查方 P2-2): status 分细了, 但 main 里 `_merged, _st = persist_results(...)`
+        # 全仓零读者, 而本函数只有 rebuilt/unrepaired 自己 print —— 于是"无人值守时唯一能看见的
+        # 那几行"里, 两种 created **仍然完全同形**。M2 的立项理由就是这句"完全同形", 只修返回值
+        # 等于没修。所以在这里各自打一行(与 rebuilt/unrepaired 同口径: 该函数自己的状态自己说)。
+        if status == "created_after_writefail":
+            print("  [warn] results.json 不在, 但 `.seen` 在 —— 上一轮写了没成功(坏表已被隔离、"
+                  "新文件没写成), 现在用本轮结果重建。若这是你手工删了 results.json 想重来, "
+                  "这行是一次**谎报**(`.seen` 只说明『写过』, 不说明『上轮失败』)。", flush=True)
+        # 首次部署**不打**: 它一辈子只发生一次, 而每建一个临时目录就跑一次的测试会把它变成噪声;
+        # "打过 = 上轮写失败 / 没打 = 首次" 这个对比本身就已经把两者分开了。
     else:
         status = "ok"
     if err:
@@ -1313,7 +1404,7 @@ def steady_top_diverse(results, exclude, host, url_path, tags, n=2, avoid_ops=()
 
 def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=None,
                  screen_capped=None, quick_skip=None, screen_skip=None, screen_zero=None,
-                 screen_wave=None, screen_floor=None, screen_need=None,
+                 screen_wave=None, screen_floor=None, screen_need=None, screen_workers=None,
                  t_screen=None, t_quick=None):
     """构造 samples.jsonl 的一行 —— **纯函数**: 只吃本轮已测出来的数, 不读盘, 不碰决策。
 
@@ -1355,6 +1446,12 @@ def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=N
                  反推出口下界, 小于 need 就**结构上撞不到**, 与"真没人撞"无关。
                  **故意不记 80/wave**: 那个数恒等于 SPEED_CEIL_MIB/wave, 不含任何观测信息,
                  而且它正是上面那次误读的来源 —— 留着它等于把坑留着。要均分份额, 用 need 反算。
+                 **v2.3.39: 它不是"配置指纹"(v2.3.38 写错了)**。max(wave) 是观测值, 上限由
+                 `len(screen_rows)` 决定: 池里只活 3 个节点时 4 路也只到档位 3 ⇒ need=240,
+                 与"W=3 的配置"逐字同形。要回答"跑在几路下"只能看 `screen_workers`。
+      screen_workers —— 这一行**实际配置的并发数**(直接记 SCREEN_WORKERS, 不是猜出来的)。
+                 replay 2c 的分桶键就是它; `need` 只作派生量与一致性校验(need 必须等于
+                 80 × max(screen_wave), 否则点名那一行 —— 那说明生产代码改了推导口径)。
       t_l0    —— L0 耗时。池子越长越慢, 有序列才知道 cron 里 03:50 那口子留得够不够。
       t_screen / t_quick —— 粗筛/快测分段耗时(秒), v2.3.34 补(审查方 P2-E)。
                  原来这两段只由 `[t]` 那行打给人看, 进 samples 之前被 `r.pop("_t")` 扔掉,
@@ -1382,6 +1479,11 @@ def build_sample(name, t_l0, prox, screen, quick, tags, l0_tail=None, l0_stats=N
         "screen_skip": list(screen_skip or []),
         "screen_zero": list(screen_zero or []),
         "screen_wave": dict((k, v) for k, v in (screen_wave or {}).items() if v is not None),
+        # v2.3.39 (审查方 P1-A): **配置指纹是这一个, 不是 screen_need**。need 是派生量
+        # (80 × max 进场档位), 而 max 档是**观测值** —— 池里只活 3 个节点时 4 路配置也只到档位 3,
+        # need=240 与"W=3 的配置"逐字同形; 反过来 budget 截断压掉的是被测节点数、不是 max 档
+        # (48 个节点只测 5 个, wave 仍是 {1,2,3,4})。要回答"这一行跑在几路下", 只能直接记它。
+        "screen_workers": (int(screen_workers) if screen_workers else None),
         # 撞顶线恒 80(每路), 与并发无关; need = 达到它所需的出口总带宽。两者分开记的理由见
         # docstring screen_floor —— 一个名字指两个量曾让 41/48 的分数"超过自己的上限"。
         "screen_floor": (round(screen_floor, 1) if screen_floor else None),
@@ -1516,6 +1618,7 @@ def test_pool(name, path, host, url_path, current_ip, sample_sink=None):
                         screen_capped=_screen_capped, quick_skip=quick_skip,
                         screen_skip=_screen_skip, screen_zero=_screen_zero,
                         screen_wave=_screen_wave, screen_floor=_floor_line, screen_need=_need_line,
+                        screen_workers=SCREEN_WORKERS,
                         t_screen=t_screen, t_quick=t_quick)
     if sample_sink is not None:
         sample_sink.append(_smp)

@@ -124,6 +124,21 @@
   M117 screen_wave 只存一个 max (回退成"不是逐 IP", 4 路分摊就真的测不了了)            -> C93
   M118 status 不区分 created / created_after_writefail (写失败与首次部署同形)           -> C86b
   M119 隔离文件名不再加序号 (同一秒两次隔离, 前一份坏证据被覆盖)                        -> C94
+  M120 replay 2c 不分组 (Cn1/Cn2 混进一张表: 两个分布的中位数没有意义)                -> C95
+  M121 created_after_writefail 不打印 (status 分细了但无人值守日志里仍然同形)           -> C86b
+  M122 2c 不按配置分桶 (丢 screen_workers: W=1 的 76.0 与 W=4 的 22.0 同桶)             -> C96
+  M123 字段完整率不看首现行 (老格式缺席与新版本丢字段压成同一个 N)                     -> C97
+  M124 WANTED 删 note (唯一承载判定理由的字段, 整列消失也全绿)                        -> C98
+  M125 配不上的 IP 静默丢弃 (只有 screen 没有 wave 的条目不计数、不报)                -> C93
+  M126 配置指纹退回 screen_need (派生量当配置: 劣化夜被读成"另一种并发", 凭空出 Δ)      -> C99
+  M127 坏夜行算成字段缺损 (decision='no winner' 的行 8 个决策字段长期挂"缺 1 行")       -> C100
+  M128 need 与 80×max(wave) 不符时沉默 (推导口径变了还继续画表)                        -> C101
+  M129 跨配置 Δ 不看 n (一侧只有一次测量也报百分号)                                    -> C96
+  M130 第六节真值不剔本轮 (拿答案对答案: Top1 命中 1/3 -> 2/3, 召回率被系统性抬高)      -> C102
+  M131 _topk 改升序 (同一把尺子翻了: 名次与重合率变成排序实现的函数)                   -> C103
+  M132 不足 3 轮也出召回结论 (两轮的中位就是一次测量, 却照样给 N 的建议)               -> C104
+  M133 wave 自证恒 OK (并发没生效的格照样进表, 整档数与别档不可比)                    -> C105
+  M134 审计不删自己造的临时目录 (NAS /tmp 累积 23.8 万条, 自检卡在 ENOSPC)             -> D9
 
 用法: python3 tests/selftest_audit.py        退出码 0 = 审计器可信
 """
@@ -137,7 +152,17 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
 AUDIT = os.path.join(HERE, "audit.py")
-FILES = ["xbox-speedtest.py", "watchdog.py", "pool_refresh.py", "nas-README.md", "deliver.sh"]
+FILES = ["xbox-speedtest.py", "watchdog.py", "pool_refresh.py", "nas-README.md", "deliver.sh",
+         # v2.3.37: replay.py 也进清单 —— C95 用**合成样本跑真 replay** 断言 2c 按组拆表,
+         # 它读的是 d/tests/replay.py(不存在才退回审计器同目录)。不放进来的话, 那条断言
+         # 永远打不到"混组"这个变异, 等于自带免疫。
+         os.path.join("tests", "replay.py"),
+         # v2.3.39 第四十轮: 探针也进清单 —— C102~C105 读的是 `d/tests/exp_screen_workers.py`,
+         # 打它的变异(M130~M133)必须改到**变异目录里那一份**。这里不能再靠下面那个
+         # `fn.startswith("tests/")` 支路: `os.path.join` 在 Windows 上给的是 `tests\xxx`,
+         # 那个判断恒为假, 于是探针根本没被复制过来 —— 变异会以 FileNotFoundError 收场,
+         # 看起来像"注入点不存在", 实际是自检自己没把被审对象带进沙箱。
+         os.path.join("tests", "exp_screen_workers.py")]
 # deliver.sh 必须在这份清单里: 变异目录只有放进来的文件, 而 `D8` / `D-crlf:deliver.sh` 在
 # audit.py 里是 `isfile` 守着的 —— 不在清单里就**静默跳过**, 于是打它自己那两条变异(现在是 M98)
 # 会以「注入点不存在」或 FileNotFoundError 收场。这不是"多复制一个文件", 是让交付脚本本身可被反证。
@@ -349,7 +374,7 @@ MUTANTS = [
     ("M59", "台账长歪 (把最新一条挪到文件底部: 头部说'新条目加在最上面', 文件实际不是严格倒序)", "LEDGER", "A18",
      "", ""),
     ("M60", "引用假账 (台账头部把一个不存在的检查编号写成'由它钉住': 行为一点不变, 只是下一个读的人会去找一条没有的检查)", "LEDGER", "A19",
-     "`xbox-speedtest/tests/audit.py` 的 **A18**", "`xbox-speedtest/tests/audit.py` 的 **C99**"),
+     "`xbox-speedtest/tests/audit.py` 的 **A18**", "`xbox-speedtest/tests/audit.py` 的 **C199**"),
     # v2.3.22: 三条都是"边界/清单"的账, 不是逻辑 bug。A19 改成只扫当前状态区之后,
     # 它的扫描边界("## 版本历史"标题)就成了契约 -> M61 打边界; 反过来"M63 历史区里塞假编号必须仍然绿"
     # 才是这次改动真正要钉的方向(expect 用 "GREEN": 变异后审计必须全过)。
@@ -652,15 +677,94 @@ MUTANTS = [
             _bak = "%s-%d" % (_base_bak, _n)
             _n += 1''',
      '''        _bak = _base_bak       # 变异: 同秒覆盖前一份坏证据'''),
+
+    # M120-M121 打 v2.3.37。M120 就是 v2.3.36 的那一刻本身: 2c 把 Cn1/Cn2 混进同一张表,
+    # 而 WIN_RATIO / DEGRADE_MIN_RECORD 在别处是按两组两个分布处理的 —— 一次 `--pool Cn2`
+    # 的定向重测就能把整张表中位数挪一次。合成样本 Cn1 恒 10.0 / Cn2 恒 90.0, 混表会得到 ~50。
+    # M121 是"修了但没人看见"这一类: 返回值分细了, 而 main 里 `_merged, _st = ...` 零读者。
+    ("M120", "replay 2c 不分组 (Cn1 10.0 / Cn2 90.0 混表, wave=1 中位落到 ~50)",
+     os.path.join("tests", "replay.py"), "C95",
+     '        _g = _r.get("group") or "?"',
+     '        _g = "mix"      # 变异: 两组混进同一张表(v2.3.36 的那一刻)'),
+    ("M121", "created_after_writefail 不再打印 (status 分细了但日志里仍然同形)",
+     "xbox-speedtest.py", "C86b",
+     '        if status == "created_after_writefail":',
+     '        if False and status == "created_after_writefail":   # 变异: 分了但不打'),
+
+    # M122-M125 打 v2.3.38。
+    # M122 就是 N1 那一刻本身: 2c 只按 (group, wave) 分桶、不读 `screen_need` —— 台账要求的那场
+    # 跨配置实验的样本一进来, wave=1 的桶里就同时装着 W=1 的 76.0 与 W=4 的 22.0, 中位 49.0。
+    # M123 是"两义合一": 完整率把老格式的缺席与新版本丢字段算进同一个 N。
+    # M124 是"唯一承载判定理由的字段恰好不被检查": WANTED 少 `note`, 整列消失也全绿。
+    # M125 是静默丢弃: 配不上的 IP 直接 continue, 真机 143 条就这么没了、一个字不说。
+    ("M122", "2c 不按配置分桶 (screen_workers 丢掉: W=1 的 76.0 与 W=4 的 22.0 落进同一桶)",
+     os.path.join("tests", "replay.py"), "C96",
+     '        _w = int(_wo) if isinstance(_wo, (int, float)) and _wo > 0 else None',
+     '        _w = None      # 变异: 配置指纹丢掉, 全落进同一桶(v2.3.37 的那一刻)'),
+    ("M123", "字段完整率不看首现行 (老格式的缺席算成新版本丢字段)",
+     os.path.join("tests", "replay.py"), "C97",
+     '        _lack = [r for r in rows[_first:] if k not in r or r.get(k) is None]',
+     '        _lack = [r for r in rows if k not in r or r.get(k) is None]   # 变异: 两义合一'),
+    ("M124", "WANTED 删掉 note (唯一承载判定理由的字段, 整列消失也全绿)",
+     os.path.join("tests", "replay.py"), "C98",
+     '          "cur", "wr", "st_cur", "st_cand", "q_cur", "note",',
+     '          "cur", "wr", "st_cur", "st_cand", "q_cur",   # 变异: note 不在清单里'),
+    ("M125", "配不上的 IP 静默丢弃 (只有 screen 没有 wave 的条目不算、不报)",
+     os.path.join("tests", "replay.py"), "C93",
+     '                _c["unpair"] += 1',
+     '                pass        # 变异: 静默丢弃(v2.3.37 的那一刻)'),
+
+    # M126-M129 打 v2.3.39。
+    # M126 就是 P1-A 的那一刻本身: 分桶键用 `screen_need`(派生量)而不是 `screen_workers` ——
+    # 劣化夜"只活 3 个节点"被读成"另一种并发配置", 于是在**从未做过实验**的样本上凭空生出 Δ。
+    # M127 是"缺席原因必须可辨"的第六遍漏在同一处: 行内写着 `no winner`, 检查不用。
+    # M128 是沉默: need 的推导口径被改了(它只是派生量), 而画表照旧。
+    # M129 是 P3-E: 一侧只有一次测量也照样把两个中位数相减、报一个百分号。
+    ("M126", "配置指纹退回 screen_need (派生量当配置: 劣化夜被读成另一种并发, 凭空生出 Δ)",
+     os.path.join("tests", "replay.py"), "C99",
+     '        _g = _r.get("group") or "?"\n        _wo = _r.get("screen_workers")',
+     '        _g = _r.get("group") or "?"\n'
+     '        _wo = _r.get("screen_need")   # 变异: 把派生量当配置(v2.3.38 的那一刻)'),
+    ("M127", "坏夜行(decision='no winner')被算成字段缺损 (8 个决策字段长期挂'缺 1 行')",
+     os.path.join("tests", "replay.py"), "C100",
+     '    if isinstance(_d, str) and _d.startswith("no winner") and k in DECISION_KEYS:',
+     '    if False and isinstance(_d, str) and k in DECISION_KEYS:   # 变异: 坏夜当成丢字段'),
+    ("M128", "need 与 80 × max(wave) 不符时沉默 (推导口径变了, 画表照旧)",
+     os.path.join("tests", "replay.py"), "C101",
+     '                if abs(_exp - _nd) > 1e-6:',
+     '                if False:      # 变异: 口径变了不吭声'),
+    ("M129", "跨配置 Δ 不看 n (一侧只有一次测量也报百分号)",
+     os.path.join("tests", "replay.py"), "C96",
+     '                _ok_n = all(n >= 2 for _, _, n in _series)',
+     '                _ok_n = True   # 变异: 一测也报 Δ(v2.3.38 的那一刻)'),
+    ("M130", "第六节真值不剔本轮 (拿答案对答案: Top1 命中 1/3 -> 2/3)",
+     os.path.join("tests", "exp_screen_workers.py"), "C102",
+     "            if j == i:\n                continue",
+     "            if False and j == i:\n                continue"),
+    ("M131", "_topk 改升序 (同一把尺子翻了: 名次与重合率变成排序实现的函数)",
+     os.path.join("tests", "exp_screen_workers.py"), "C103",
+     "key=lambda kv: (-kv[1], kv[0])", "key=lambda kv: (kv[1], kv[0])"),
+    ("M132", "不足 3 轮也出召回结论 (两轮的中位就是一次测量)",
+     os.path.join("tests", "exp_screen_workers.py"), "C104",
+     "    if len(rs) < 3:", "    if False:   # 变异: 两轮也出结论"),
+    ("M133", "wave 自证恒 OK (并发没生效的格照样进表)",
+     os.path.join("tests", "exp_screen_workers.py"), "C105",
+     '"OK" if got == [w] else', '"OK" if True else'),
+    ("M134", "审计不删自己造的临时目录 (NAS /tmp 累积 23.8 万条 -> tmpfs 塞满, 自检卡在 ENOSPC)",
+     "tests/audit.py", "D9",
+     "        shutil.rmtree(_t, ignore_errors=True)",
+     "        pass   # 变异: 不删(实测把 NAS 的 /tmp 塞满)"),
 ]
 
 
-def run_audit(d, extra_env=None):
+def run_audit(d, extra_env=None, audit_path=None):
     env = dict(os.environ)
     env["XBOX_LEDGER"] = LEDGER      # 台账不在 FILES 里, 必须指回真身(否则 A18 只会报"台账不存在")
     if extra_env:
         env.update(extra_env)
-    p = subprocess.run([sys.executable, AUDIT, "--dir", d], env=env,
+    # v2.3.39 第四十轮: `audit_path` 是为了打**审计器自己**的变异(D9 的 M134)。
+    # 不传就是真身 —— 那时"注入到 audit.py 的改动"根本不会被执行, 会以"漏网"收场。
+    p = subprocess.run([sys.executable, audit_path or AUDIT, "--dir", d], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
@@ -670,7 +774,11 @@ def _copy_all(dst):
     for f in FILES:
         p = os.path.join(SRC, f)
         if os.path.isfile(p):
-            shutil.copy(p, dst)
+            out = os.path.join(dst, f)
+            od = os.path.dirname(out)
+            if od and not os.path.isdir(od):
+                os.makedirs(od)          # tests/replay.py 这种带子目录的交付物
+            shutil.copy(p, out)
 
 def main():
     tmp = tempfile.mkdtemp(prefix="mutant_")
@@ -723,10 +831,17 @@ def main():
             d = os.path.join(tmp, mid)
             os.makedirs(d)
             _copy_all(d)
-            if fn.startswith("tests/"):
+            if fn.replace("\\", "/").startswith("tests/"):
                 # 打 tests/ 里那些文件的变异(比如 replay.WANTED), 必须把它们**放进变异目录** ——
                 # audit 对 tests/* 默认走真实路径(见 A22 的注释), 不复制过来就等于改了个没人读的副本。
-                os.makedirs(os.path.join(d, "tests"))
+                # v2.3.39 第四十轮: 判断前先把 `\` 归一成 `/` —— `os.path.join` 在 Windows 上给的是
+                # `tests\exp_screen_workers.py`, 直接用 `startswith("tests/")` 恒为假, 探针的三条变异
+                # 会以 FileNotFoundError 收场(看起来像"注入点不存在", 实际是自检没把被审对象带进来)。
+                # v2.3.37: 不能再无条件 makedirs —— FILES 里已经有 `tests/replay.py` 了, `_copy_all`
+                # 会先把 `d/tests` 建出来, 这一行就从"建目录"变成 `FileExistsError`(实测 M103 当场崩,
+                # 前面 102 条已经跑完, 后面 19 条一条没跑 —— 崩在这里看起来像"自检跑完了")。
+                if not os.path.isdir(os.path.join(d, "tests")):
+                    os.makedirs(os.path.join(d, "tests"))
                 shutil.copy(os.path.join(HERE, os.path.basename(fn)),
                             os.path.join(d, "tests", os.path.basename(fn)))
             extra_env = {}
@@ -813,7 +928,15 @@ def main():
                     fails.append(mid)
                     continue
                 open(p, "w", encoding="utf-8", newline="\n").write(src.replace(old, new, 1))
-            rc, out = run_audit(d, extra_env)
+            # 打审计器自己的变异(M134): `run_audit` 默认跑**真身**, 必须换成变异目录里那一份,
+            # 否则注入的改动根本没被执行, 结果会以"漏网"收场 —— 看起来像断言不灵, 实际是改了个
+            # 没人读的副本(和 A22 那个"文件不存在"是同一类)。同时把 XBOX_SELFTEST 指回真身:
+            # 变异目录里没有 selftest_audit.py, A22 会凭这一点假红。
+            _ap = None
+            if fn.replace("\\", "/").endswith("tests/audit.py"):
+                _ap = os.path.join(d, fn)
+                extra_env.setdefault("XBOX_SELFTEST", os.path.join(HERE, "selftest_audit.py"))
+            rc, out = run_audit(d, extra_env, _ap)
             red = re.findall(r"^FAIL (\S+)", out, re.M)
             if expect_cid == "GREEN":
                 # 这类变异不是缺陷, 是**边界不该被跨过**的反证: 改动后审计必须仍然全过。
