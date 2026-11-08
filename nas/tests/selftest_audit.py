@@ -139,6 +139,9 @@
   M132 不足 3 轮也出召回结论 (两轮的中位就是一次测量, 却照样给 N 的建议)               -> C104
   M133 wave 自证恒 OK (并发没生效的格照样进表, 整档数与别档不可比)                    -> C105
   M134 审计不删自己造的临时目录 (NAS /tmp 累积 23.8 万条, 自检卡在 ENOSPC)             -> D9
+  M135 第七节全部快测先跑 (逐 IP 反向没了: 秩相关含时间漂移, 是时钟的函数)            -> C106
+  M136 第七节秩相关把 0 值也算进来 (没测出被当成最慢参与排序)                          -> C107
+  M137 from-json 配 stage steady 静默跳过 (不做事、不报错、还退出 0)                   -> C108
 
 用法: python3 tests/selftest_audit.py        退出码 0 = 审计器可信
 """
@@ -754,6 +757,17 @@ MUTANTS = [
      "tests/audit.py", "D9",
      "        shutil.rmtree(_t, ignore_errors=True)",
      "        pass   # 变异: 不删(实测把 NAS 的 /tmp 塞满)"),
+    ("M135", "第七节全部快测先跑 (逐 IP 反向没了: 秩相关含时间漂移, 是时钟的函数)",
+     os.path.join("tests", "exp_screen_workers.py"), "C106",
+     "        if k % 2 == 1:", "        if False:   # 变异: 全部快测先跑"),
+    ("M136", "第七节秩相关把 0 值也算进来 (没测出被当成最慢参与排序)",
+     os.path.join("tests", "exp_screen_workers.py"), "C107",
+     'ok = [r["ip"] for r in rows if r["quick"] > 0 and r["steady"] > 0]',
+     'ok = [r["ip"] for r in rows if r["quick"] > 0]   # 变异: 稳态 0 也进来'),
+    ("M137", "from-json 配 stage steady 静默跳过 (不做事、不报错、还退出 0)",
+     os.path.join("tests", "exp_screen_workers.py"), "C108",
+     '        if a.stage in ("steady", "both"):',
+     '        if False:   # 变异: 静默跳过第七节'),
 ]
 
 

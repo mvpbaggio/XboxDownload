@@ -260,7 +260,7 @@ def _replay(d, rows):
     return _pr.returncode, _pr.stdout.decode("utf-8", "replace")
 
 
-def _probe(d, cells, ns="1", recall_w=None):
+def _probe(d, cells, ns="1", recall_w=None, extra=()):
     """合成格 -> 临时 jsonl -> **被审目录里**那份 exp_screen_workers.py, 返回 (返回码, 输出)。
 
     与 `_replay` 同一套理由(路径先从 `d` 取; stdout 显式 utf-8), 另加一条**只在这里**成立的:
@@ -278,6 +278,7 @@ def _probe(d, cells, ns="1", recall_w=None):
     _cmd = [sys.executable, _ep, "--dir", d, "--from-json", _p, "--screen-n", ns]
     if recall_w is not None:
         _cmd += ["--recall-w", str(recall_w)]
+    _cmd += list(extra)
     _env = dict(os.environ)
     _env["PYTHONIOENCODING"] = "utf-8"
     _pr = subprocess.run(_cmd, env=_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -3278,6 +3279,102 @@ def audit_behaviour(d):
         "坏格行=%r 好格含 OK=%r"
         % ([l.strip() for l in _o105.splitlines() if "自证" in l][:1],
            "实际取值 [4] OK" in _rep102(_e102, _c102, [])))
+
+    # ---- C106 第七节: 逐 IP 紧邻 + 奇数 IP 反向 ----
+    # 第七节问的是「快测这一关选得准不准」, 答案是两个尺子的秩相关。而秩相关**最容易被时钟伪造**:
+    # 先跑完 N 个快测再跑 N 个稳态, 中间隔几分钟, 出口漂移本身就能造出一个相关系数 —— 那是时间的
+    # 函数, 不是尺子的函数。防它的只有两行: 同一 IP 上两把尺子相邻(`batch` 里两把尺子挨着跑)、
+    # 以及奇数 IP 反向(`if k % 2 == 1` 先跑稳态)。这两行都**不会被任何输出体现** —— 顺序换了表还是
+    # 那张表, 结论照打。所以只能抓调用序列。
+    _ord106 = []
+
+    class _M106(object):
+        QUICK_CHUNK = 8 * 1048576
+        QUICK_ROUNDS = 1
+
+        def dl_speed(self, ip, host, path, nbytes):
+            _ord106.append(("quick", ip))
+            return 100.0 - 10.0 * _ord106.count(("quick", ip))  # 值不重要, 只要 > 0
+
+        median_of = staticmethod(load(os.path.join(d, "xbox-speedtest.py"), "xst106").median_of)
+
+    class _W106(object):
+        STEADY = 8
+        STEADY_MAX_BYTES = 256 * 1024 * 1024
+
+        def steady(self, ip, host=None, path=None):
+            _ord106.append(("steady", ip))
+            return 99.0  # 有数即可; C107 才管 0 值
+
+    _b106 = [("1.1.1.1", ""), ("2.2.2.2", ""), ("3.3.3.3", ""), ("4.4.4.4", "")]
+    _sc106 = dict((ip, 50.0) for ip, _t in _b106)
+    _o106 = io.StringIO()
+    with contextlib.redirect_stdout(_o106):
+        _e102.sec_steady(_M106(), _W106(), _b106, "h", "/p", _sc106, 1)
+    _o106 = _o106.getvalue()
+    # 每个 IP 必须占**连续**两格, 且偶数号 IP 是 quick 在前、奇数号 IP 是 steady 在前。
+    # 写成「相对上一个 IP 的顺序翻转」而不是「等于某个字面序列」: 字面序列在 batch 顺序一变就假红。
+    _ok106 = []
+    for _k, (_ip, _t) in enumerate(_b106):
+        _two = _ord106[2 * _k:2 * _k + 2]
+        _ok106.append([_x[1] for _x in _two] == [_ip, _ip]
+                      and _two[0][0] == ("quick" if _k % 2 == 0 else "steady"))
+    chk("C106", "第七节必须逐 IP 紧邻两把尺子 + 奇数 IP 反向(稳态先跑): 否则「快测 vs 稳态」的秩相关"
+                "含时间漂移, 是时钟的函数而不是尺子的函数 —— 而顺序换了输出一字不差, 只有调用序列能抓",
+        all(_ok106) and len(_ord106) == 2 * len(_b106),
+        "序列=%r 逐 IP 合规=%r" % (_ord106, _ok106))
+
+    # ---- C107 第七节: 秩相关只在「两边都出数」的 IP 上算 ----
+    # `median_of` 会丢 0 值(0 = 没测出), 所以某一侧为 0 的 IP 在那一侧**没有名次**。把它塞进秩相关,
+    # 等于把「没测出」当成「最慢」参与排序 —— 一个掉线的节点就能把相关系数拽下去, 而这种行在真机
+    # 上一次跑里必然出现(Cn1 当时就有 quick 有数、steady 0 的)。同时 < 3 个必须拒答: 两个点的
+    # Spearman 只有 ±1 两种取值, 那不是统计量是符号。
+    _tbl107 = {"1.1.1.1": (100.0, 100.0), "2.2.2.2": (90.0, 20.0),
+               "3.3.3.3": (80.0, 60.0), "4.4.4.4": (70.0, 0.0)}
+
+    class _M107(_M106):
+        QUICK_ROUNDS = 1
+
+        def dl_speed(self, ip, host, path, nbytes):
+            return _tbl107[ip][0]
+
+    class _W107(_W106):
+        def steady(self, ip, host=None, path=None):
+            return _tbl107[ip][1]
+
+    def _run107(_b):
+        _s = io.StringIO()
+        with contextlib.redirect_stdout(_s):
+            _e102.sec_steady(_M107(), _W107(), _b, "h", "/p",
+                             dict((ip, 50.0) for ip, _t in _b), 1)
+        return _s.getvalue()
+
+    _b107 = [(ip, "") for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4")]
+    _o107 = _run107(_b107)
+    # 3 个里剔掉 4.4.4.4 ⇒ 只剩 2 个 ⇒ 必须走拒答那一支, 而不是打一个 ±1 的"相关系数"
+    _b107b = [(ip, "") for ip in ("1.1.1.1", "2.2.2.2", "4.4.4.4")]
+    _o107b = _run107(_b107b)
+    chk("C107", "第七节秩相关只算「两边都出数」的 IP: 4.4.4.4 稳态为 0(没测出)时必须标「← 有 0 值」"
+                "并剔出相关(4 个里只算 3 个), 剔完只剩 2 个时必须拒答 —— 把 0 当最慢参与排序, "
+                "一个掉线节点就能把相关系数拽下去",
+        "← 有 0 值, 不进秩相关" in _o107
+        and "秩相关(只算两边都出数的 3 个)" in _o107
+        and "只有 2 个(< 3)" in _o107b,
+        "4个:%r 3个:%r"
+        % ([l.strip() for l in _o107.splitlines() if "秩相关(" in l][:1],
+           [l.strip() for l in _o107b.splitlines() if "< 3" in l][:1]))
+
+    # ---- C108 `--from-json` + `--stage steady` 必须拒答, 不许静默跳过 ----
+    # 第七节的输入是**现场量出来的** quick/steady 原始值, `--from-json` 的格里只有粗筛分。
+    # 所以这个组合在结构上无法复现那一节 —— 但 `--from-json` 分支原本在读完格就直接 return,
+    # 于是它会打出第六节的表、退出 0, 而用户要的那一节一个字都没跑。失败方向与 `./deliver.sh pus`
+    # 被当成 check 完全一样(既不做事、也不报错、还回绿), 所以宁可拒答: 退出码非 0 + 说清怎么绕。
+    _rc108, _o108 = _probe(d, _c102, ns="1", extra=["--stage", "steady"])
+    chk("C108", "`--from-json` 配 `--stage steady` 必须**拒答**(退出码非 0 + 说「第七节无法复现」): "
+                "from-json 里没有稳态原始值, 静默跳过会打出第六节的表还退出 0 —— 与 `push` 拼错被"
+                "当 check 是同一类「不做事却回绿」",
+        _rc108 != 0 and "第七节无法复现" in _o108,
+        "rc=%s 尾部=%r" % (_rc108, _o108.strip().splitlines()[-1:]))
 
     # ---- C86 results.json 合并: 三条静默丢一组的路全部堵住 ----
     # 审查方 P1-B: C13 验读侧(损坏 -> 空表, 那是**对的**)、C22 验写侧(seed 是合法 Cn2),

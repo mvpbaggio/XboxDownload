@@ -70,6 +70,22 @@ def load_mod(root):
     return m
 
 
+def load_wd(root):
+    """按路径加载 `watchdog.py` —— 第七节要的稳态函数在那个文件里(与每小时体检同一份实现)。
+
+    为什么不复制一份稳态逻辑过来: 稳态的窗口口径(8s / 256MiB / 从响应头开始计时)本身就是
+    要验证的对象。复制一份就等于「用我的尺子量完, 说生产那把尺子准」。
+    """
+    p = os.path.join(root, "watchdog.py")
+    spec = importlib.util.spec_from_file_location("wd_exp", p)
+    if spec is None or spec.loader is None:
+        raise SystemExit("加载失败: %s" % p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["wd_exp"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
 def pct(vals, q):
     """分位数(线性插值)。py3.8 的 statistics 没有 quantiles, 自己算一行。"""
     if not vals:
@@ -175,10 +191,25 @@ def main():
                     help="第六节要对照的 SCREEN_N 档位, 逗号分隔; 给空串则不跑那一节")
     ap.add_argument("--recall-w", type=int, default=None,
                     help="第六节用哪个并发档的格(默认最大档 = 生产档)")
+    ap.add_argument("--stage", default="workers", choices=("workers", "steady", "both"),
+                    help="跑哪几节: workers = W 对照(默认, 原有行为); "
+                         "steady = 第七节(粗筛→快测→稳态 三段尺子); both = 两节都跑")
+    ap.add_argument("--steady-n", type=int, default=None,
+                    help="第七节的节点数, 默认 = MAX_QUICK_CANDS(生产快测候选上限, 16)")
+    ap.add_argument("--steady-rounds", type=int, default=None,
+                    help="第七节稳态轮数, 默认 = 生产 STEADY_ROUNDS(3)")
+    ap.add_argument("--steady-json", default=None,
+                    help="第七节逐 IP 的 quick/steady 原始值落一份 json")
     a = ap.parse_args()
     ns = [int(x) for x in a.screen_n.split(",") if x.strip()]
 
     if a.from_json:
+        # `--from-json` 的格里只有粗筛分, 没有快测/稳态的原始值, 所以第七节在结构上无法复现。
+        # 不拦的话它会**静默跳过**: 打出第六节的表、退出 0, 而用户要的那一节一个字都没跑 ——
+        # 和 deliver.sh 里 `pus` 被当成 check 是同一类失败方向。宁可拒答。
+        if a.stage in ("steady", "both"):
+            raise SystemExit("--from-json 里没有稳态原始值, 第七节无法复现; "
+                             "要么去掉 --stage %s, 要么现场重跑(不加 --from-json)" % a.stage)
         cells = [json.loads(l) for l in open(a.from_json, encoding="utf-8") if l.strip()]
         use = [c for c in cells if not c.get("warmup")]
         if not use:
@@ -231,6 +262,27 @@ def main():
           % (", ".join("%s@%.1fms" % (ip, ms_of[ip]) for ip, _ in batch[:3]),
              med([ms_of[ip] for ip, _ in batch]), max(ms_of[ip] for ip, _ in batch)))
 
+    # ---- 第七节: 粗筛 → 快测 → 稳态。节点集必须是**粗筛分前 N**, 与生产「按粗筛分截到
+    #      MAX_QUICK_CANDS」同形; 拿 L0 握手序当候选序是不对的 —— 生产截断看的是粗筛分。
+    if a.stage in ("steady", "both"):
+        s_n = a.steady_n or mod.MAX_QUICK_CANDS
+        s_r = a.steady_rounds or mod.STEADY_ROUNDS
+        print("-" * 78)
+        print("第七节准备: 先跑一格粗筛(W=%d, 生产值)拿候选序" % mod.SCREEN_WORKERS)
+        _c, _s, _z, _w = [], [], [], {}
+        _ranked = mod._screen(batch, host, url_path, ms_of=ms_of, capped_out=_c,
+                              skip_out=_s, zero_out=_z, wave_out=_w)
+        _sc = dict((ip, float(sp)) for sp, ip in _ranked)
+        _pick = _topk(_sc, s_n)
+        if len(_pick) < s_n:
+            print("! 粗筛只出 %d 个(要 %d): 就按这么多量" % (len(_pick), s_n))
+        _tagd = dict(batch)
+        sec_steady(mod, load_wd(a.dir), [(ip, _tagd.get(ip, "")) for ip in _pick],
+                   host, url_path, _sc, s_r, out_json=a.steady_json)
+        if a.stage == "steady":
+            print("=" * 78)
+            return 0
+
     cells = []
     t_all = time.perf_counter()
     for r in range(a.rounds + a.warmup):
@@ -256,6 +308,120 @@ def main():
     return 0 if report(use, ws, len(batch), mod.SCREEN_CHUNK // 1048576, ns=ns,
                        prod_n=mod.SCREEN_N, max_cands=mod.MAX_QUICK_CANDS,
                        recall_w=a.recall_w) else 1
+
+
+def sec_steady(mod, wd, batch, host, path, screen_sc, rounds, out_json=None):
+    """第七节: 粗筛 8MiB → 快测 80MB → 稳态 8s, 三段尺子的秩相关。
+
+    为什么必须现场量, 不能拿生产日志回放
+    ------------------------------------
+    `samples.jsonl` 里 quick 与 steady 都有, 但它们**不是同一批节点、也不是同一时刻**:
+    quick 是粗筛前 16 个候选, steady 只测冠军/当前/热备(3~4 个), 且稳态比快测晚一分钟以上。
+    两者之差里混着「节点不同」+「时刻不同」两个因素, 分不开。要回答「快测这一关选得准不准」,
+    只能同一批节点、相邻时刻、每把尺子各量一遍。
+
+    真机现场(2026-11-08 18:34 全量跑): Cn1 快测冠军 median=97.1MiB/s, 稳态只有 25.4;
+    当前 IP 稳态 91.2 —— 快测第一名的稳态值不到当前 IP 的三成。这不是噪声量级的差距,
+    但它只是**一个样本**, 说明不了「快测这一关整体上准不准」。这一节要的是那个分布。
+
+    为什么逐 IP 交替, 而不是「先全跑快测再全跑稳态」
+    ----------------------------------------------
+    上一轮已实测出口随时间的漂移很大(W=1 档 48 个读数分属 48 个瞬间)。若先跑完 N 个快测
+    再跑 N 个稳态, 时间差本身就能造出一个秩相关 —— 那是时钟的函数, 不是尺子的函数。
+    所以每个 IP 上两把尺子**紧邻**, 且**奇数 IP 反向**(稳态先跑), 把「谁先跑谁占带宽」
+    的系统偏置也平均掉。
+
+    为什么稳态用 watchdog 的实现而不是主程序的 dl_steady
+    --------------------------------------------------
+    生产链上最终做「换不换」判定的是 `watchdog.steady`(8s 窗口 / 256MiB 上限 / 从响应头计时),
+    不是 `dl_steady`。两者口径已统一(见 README 已知局限), 但既然问的是「生产会不会选错」,
+    就该拿生产那把尺子量。
+    """
+    n = len(batch)
+    sbytes = float(getattr(wd, "STEADY_MAX_BYTES", 256 * 1024 * 1024))
+    print("\n" + "=" * 78)
+    print("七、三段尺子 —— 粗筛 8MiB → 快测 %dMB → 稳态 %.0fs/%.0fMiB"
+          % (mod.QUICK_CHUNK // 1048576, wd.STEADY, sbytes / 1048576.0))
+    print("  同一批 %d 个节点(粗筛分前 %d); 每 IP 两把尺子紧邻, 奇数 IP 反向(稳态先跑)" % (n, n))
+    print("  稳态取 watchdog.steady 本体(生产判定用的就是它), %d 轮取中位、丢 0 值" % rounds)
+
+    rows = []
+    t0 = time.perf_counter()
+    for k, (ip, _tag) in enumerate(batch):
+        if k % 2 == 1:                       # 反向: 稳态先跑, 把顺序偏置平均掉
+            sr = [wd.steady(ip, host, path) for _ in range(rounds)]
+            qr = [mod.dl_speed(ip, host, path, mod.QUICK_CHUNK)
+                  for _ in range(mod.QUICK_ROUNDS)]
+        else:
+            qr = [mod.dl_speed(ip, host, path, mod.QUICK_CHUNK)
+                  for _ in range(mod.QUICK_ROUNDS)]
+            sr = [wd.steady(ip, host, path) for _ in range(rounds)]
+        q = mod.median_of(qr)
+        s = mod.median_of(sr)
+        rows.append({"ip": ip, "quick": q, "steady": s, "qr": qr, "sr": sr,
+                     "rev": (k % 2 == 1), "screen": screen_sc.get(ip, 0.0)})
+        print("  %2d/%-2d %-16s 快测 %6.1f  稳态 %6.1f%s"
+              % (k + 1, n, ip, q, s,
+                 "" if (q > 0 and s > 0) else "  ← 有 0 值, 不进秩相关"),
+              flush=True)
+    print("  量完 %d 个, 用时 %.1fs" % (n, time.perf_counter() - t0))
+
+    if out_json:
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({"host": host, "path": path, "steady_sec": wd.STEADY,
+                       "steady_max_bytes": sbytes, "quick_bytes": mod.QUICK_CHUNK,
+                       "rows": rows}, f, ensure_ascii=False, indent=1)
+        print("  逐 IP 原始值已落盘: %s" % out_json)
+
+    ok = [r["ip"] for r in rows if r["quick"] > 0 and r["steady"] > 0]
+    if len(ok) < 3:
+        print("  两边都出数的只有 %d 个(< 3), 秩相关不可算 —— 这一节不下结论。" % len(ok))
+        return
+    xo = dict((r["ip"], r["screen"]) for r in rows if r["ip"] in ok)
+    qo = dict((r["ip"], r["quick"]) for r in rows if r["ip"] in ok)
+    so = dict((r["ip"], r["steady"]) for r in rows if r["ip"] in ok)
+
+    print("\n  %-16s %8s %5s %9s %5s %9s %5s %8s %8s"
+          % ("IP", "粗筛8M", "名次", "快测80M", "名次", "稳态", "名次", "稳÷快", "快测窗口"))
+    for ip in _topk(qo, len(qo)):
+        q, s = qo[ip], so[ip]
+        ratio = (s / q) if q else 0.0
+        win = (mod.QUICK_CHUNK / (1048576.0 * q)) if q else 0.0
+        print("  %-16s %8.1f %5d %9.1f %5d %9.1f %5d %8.2f %7.2fs"
+              % (ip, xo[ip], _rank_of(xo, ip), q, _rank_of(qo, ip),
+                 s, _rank_of(so, ip), ratio, win))
+
+    print("\n  秩相关(只算两边都出数的 %d 个):" % len(ok))
+    for lbl, da, db in (("粗筛 vs 快测", xo, qo),
+                        ("快测 vs 稳态", qo, so),
+                        ("粗筛 vs 稳态", xo, so)):
+        sp = spearman([da[ip] for ip in ok], [db[ip] for ip in ok])
+        kk = min(8, len(ok))
+        k3 = len(set(_topk(da, 3)) & set(_topk(db, 3)))
+        k8 = len(set(_topk(da, kk)) & set(_topk(db, kk)))
+        print("    %-12s Spearman %+.3f · 前3 重合 %d/3 · 前%d 重合 %d/%d"
+              % (lbl, sp, k3, kk, k8, kk))
+
+    cq = _topk(qo, 1)[0]
+    cs = _topk(so, 1)[0]
+    print("\n  快测冠军 %s: 稳态 %.1f, 在稳态里排第 %d 名"
+          % (cq, so[cq], _rank_of(so, cq)))
+    print("  稳态冠军 %s: 快测 %.1f, 在快测里排第 %d 名"
+          % (cs, qo[cs], _rank_of(qo, cs)))
+    if so[cs]:
+        print("  按快测选冠军的实际代价: 稳态 %.1f vs 最优 %.1f ⇒ **慢 %.1f%%**"
+              % (so[cq], so[cs], (1.0 - so[cq] / so[cs]) * 100.0))
+
+    rats = [so[ip] / qo[ip] for ip in ok if qo[ip]]
+    wins = [mod.QUICK_CHUNK / (1048576.0 * qo[ip]) for ip in ok if qo[ip]]
+    print("\n  稳态÷快测: 中位 %.2f (P10 %.2f / P90 %.2f), n=%d"
+          % (med(rats), pct(rats, 0.10), pct(rats, 0.90), len(rats)))
+    print("  快测窗口(80MiB ÷ 速度): 中位 %.2fs (P10 %.2f / P90 %.2f)"
+          % (med(wins), pct(wins, 0.10), pct(wins, 0.90)))
+    print("  读法: 比值 1.00 = 两把尺子量到同一个数; 明显 < 1 且窗口只有一两秒 ⇒")
+    print("        快测量的是 **CDN 首包突发**, 超过那个窗口的持续掉速在快测里看不见。")
+    print("        秩相关高但比值低 ⇒ 快测仍能**排序**(它可以当预筛);")
+    print("        秩相关也低 ⇒ 快测这一关的排名不能拿来做决策, 只能拿来做候选池。")
 
 
 def sec_recall(use, ws, ns, prod_n, max_cands, w=None):
